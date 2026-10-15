@@ -2,3 +2,4 @@ tinify>=1.7.2
 customtkinter>=6.0.0
 pillow>=10.4.0
 protobuf>=7.35.1
+tkinterdnd2>=0.4.2
