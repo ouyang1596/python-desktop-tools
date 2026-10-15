@@ -12,6 +12,7 @@ import customtkinter as ctk
 
 from image_compressor.main import App as ImageCompressorApp
 from json_formatter.main import App as JsonFormatterApp
+from svga_preview.main import App as SvgaPreviewApp
 
 FONT = ("Microsoft YaHei UI", 13)
 FONT_SM = ("Microsoft YaHei UI", 12)
@@ -28,6 +29,11 @@ TOOLS = (
         "key": "json",
         "title": "JSON 格式化",
         "description": "缩进排版或压成一行",
+    },
+    {
+        "key": "svga",
+        "title": "SVGA 预览",
+        "description": "播放 SVGA 动画，查看画布和帧信息",
     },
 )
 
@@ -98,6 +104,7 @@ class Shell(ctk.CTk):
         self.pages = {
             "image": ImageCompressorApp(self, on_back=self.show_home),
             "json": JsonFormatterApp(self, on_back=self.show_home),
+            "svga": SvgaPreviewApp(self, on_back=self.show_home),
         }
         self.show_home()
 
@@ -116,8 +123,12 @@ class Shell(ctk.CTk):
 
     @staticmethod
     def _hide(widget) -> None:
-        if widget.winfo_manager() == "grid":
-            widget.grid_remove()
+        if widget.winfo_manager() != "grid":
+            return
+        pause = getattr(widget, "pause", None)
+        if callable(pause):
+            pause()
+        widget.grid_remove()
 
 
 def main() -> None:

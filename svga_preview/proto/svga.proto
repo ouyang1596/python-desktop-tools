@@ -1,0 +1,128 @@
+syntax = "proto3";
+package com.opensource.svga;
+option objc_class_prefix = "SVGAProto";
+option java_package = "com.opensource.svgaplayer.proto";
+
+message MovieParams {
+    float viewBoxWidth = 1;     // 画布宽
+    float viewBoxHeight = 2;    // 画布高
+    int32 fps = 3;              // 动画每秒播放帧数
+    int32 frames = 4;           // 动画总帧数
+}
+
+message SpriteEntity {
+    string imageKey = 1;                // 元件所对应的位图键名。含 .vector 为矢量图层，含 .matte 为遮罩图层。
+    repeated FrameEntity frames = 2;    // 帧列表
+    string matteKey = 3;                // 被遮罩图层的 matteKey 对应遮罩图层的 imageKey
+}
+
+message AudioEntity {
+    string audioKey = 1;        // 音频文件名
+    int32 startFrame = 2;       // 音频播放起始帧
+    int32 endFrame = 3;         // 音频播放结束帧
+    int32 startTime = 4;        // 音频播放起始时间
+    int32 totalTime = 5;        // 音频总长度
+}
+
+message Layout {
+    float x = 1;
+    float y = 2;
+    float width = 3;
+    float height = 4;
+}
+
+// a、d 缺省为 1。使用 optional 才能区分「没写」和「写了 0」，与官方播放器一致。
+message Transform {
+    optional float a = 1;
+    optional float b = 2;
+    optional float c = 3;
+    optional float d = 4;
+    optional float tx = 5;
+    optional float ty = 6;
+}
+
+message ShapeEntity {
+
+    enum ShapeType {
+        SHAPE = 0;      // 路径
+        RECT = 1;       // 矩形
+        ELLIPSE = 2;    // 椭圆
+        KEEP = 3;       // 与前帧一致
+    }
+
+    message ShapeArgs {
+        string d = 1;  // SVG 路径
+    }
+
+    message RectArgs {
+        float x = 1;
+        float y = 2;
+        float width = 3;
+        float height = 4;
+        float cornerRadius = 5;
+    }
+
+    message EllipseArgs {
+        float x = 1;        // 圆心 X
+        float y = 2;        // 圆心 Y
+        float radiusX = 3;
+        float radiusY = 4;
+    }
+
+    message ShapeStyle {
+
+        message RGBAColor {
+            float r = 1;
+            float g = 2;
+            float b = 3;
+            optional float a = 4; // 缺省为不透明
+        }
+
+        enum LineCap {
+            LineCap_BUTT = 0;
+            LineCap_ROUND = 1;
+            LineCap_SQUARE = 2;
+        }
+
+        enum LineJoin {
+            LineJoin_MITER = 0;
+            LineJoin_ROUND = 1;
+            LineJoin_BEVEL = 2;
+        }
+
+        RGBAColor fill = 1;
+        RGBAColor stroke = 2;
+        float strokeWidth = 3;
+        LineCap lineCap = 4;
+        LineJoin lineJoin = 5;
+        float miterLimit = 6;
+        float lineDashI = 7;
+        float lineDashII = 8;
+        float lineDashIII = 9;
+    }
+
+    ShapeType type = 1;
+    oneof args {
+        ShapeArgs shape = 2;
+        RectArgs rect = 3;
+        EllipseArgs ellipse = 4;
+    }
+    ShapeStyle styles = 10;
+    Transform transform = 11;
+}
+
+message FrameEntity {
+    float alpha = 1;
+    Layout layout = 2;
+    Transform transform = 3;
+    string clipPath = 4;
+    repeated ShapeEntity shapes = 5;
+}
+
+message MovieEntity {
+    string version = 1;
+    MovieParams params = 2;
+    map<string, bytes> images = 3;
+    repeated SpriteEntity sprites = 4;
+    repeated AudioEntity audios = 5;
+}
