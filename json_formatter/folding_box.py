@@ -59,6 +59,20 @@ class FoldingTextbox(ctk.CTkTextbox):
                 self._folds_by_line[fold.start_line] = fold
         self._render()
 
+    def expand_all(self) -> bool:
+        if not self._folds:
+            return False
+        self._collapsed = set()
+        self._render()
+        return True
+
+    def collapse_all(self) -> bool:
+        if not self._folds:
+            return False
+        self._collapsed = {fold.key for fold in self._folds}
+        self._render()
+        return True
+
     def _create_grid_for_text_and_scrollbars(
         self,
         re_grid_textbox=False,

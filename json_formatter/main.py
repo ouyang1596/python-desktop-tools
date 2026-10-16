@@ -97,8 +97,12 @@ class App(ctk.CTkFrame):
         editors.grid_columnconfigure(1, weight=1)
         editors.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(editors, text="输入", font=FONT, anchor="w").grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ctk.CTkLabel(editors, text="结果", font=FONT, anchor="w").grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=(0, 6))
+        ctk.CTkLabel(editors, text="输入", font=FONT, anchor="w", height=28).grid(row=0, column=0, sticky="sw", pady=(0, 6))
+        result_header = ctk.CTkFrame(editors, fg_color="transparent")
+        result_header.grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=(0, 6))
+        ctk.CTkLabel(result_header, text="结果", font=FONT, anchor="w", height=28).pack(side="left")
+        ctk.CTkButton(result_header, text="全部折叠", width=88, height=28, command=self._collapse_all).pack(side="right")
+        ctk.CTkButton(result_header, text="全部展开", width=88, height=28, command=self._expand_all).pack(side="right", padx=(0, 8))
         self.input_box = ctk.CTkTextbox(editors, font=FONT_CODE, wrap="none", undo=True)
         self.input_box.grid(row=1, column=0, sticky="nsew")
         self.output_box = FoldingTextbox(editors, font=FONT_CODE, wrap="none", undo=True)
@@ -135,6 +139,18 @@ class App(ctk.CTkFrame):
 
     def _minify(self) -> None:
         self._render(minify_json, success="已压缩为一行")
+
+    def _expand_all(self) -> None:
+        if not self.output_box.expand_all():
+            self._set_status("没有可展开的内容", error=True)
+            return
+        self._set_status("已全部展开")
+
+    def _collapse_all(self) -> None:
+        if not self.output_box.collapse_all():
+            self._set_status("没有可折叠的内容", error=True)
+            return
+        self._set_status("已全部折叠")
 
     def _render(self, convert, *args, success: str) -> None:
         try:
