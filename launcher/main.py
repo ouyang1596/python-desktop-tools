@@ -13,6 +13,7 @@ import customtkinter as ctk
 from image_compressor.main import App as ImageCompressorApp
 from json_formatter.main import App as JsonFormatterApp
 from svga_preview.main import App as SvgaPreviewApp
+from timestamp_converter.main import App as TimestampConverterApp
 
 FONT = ("Microsoft YaHei UI", 13)
 FONT_SM = ("Microsoft YaHei UI", 12)
@@ -34,6 +35,11 @@ TOOLS = (
         "key": "svga",
         "title": "SVGA 预览",
         "description": "播放 SVGA 动画，查看画布和帧信息",
+    },
+    {
+        "key": "timestamp",
+        "title": "时间戳转换",
+        "description": "秒、毫秒与日期时间互转",
     },
 )
 
@@ -105,6 +111,7 @@ class Shell(ctk.CTk):
             "image": ImageCompressorApp(self, on_back=self.show_home),
             "json": JsonFormatterApp(self, on_back=self.show_home),
             "svga": SvgaPreviewApp(self, on_back=self.show_home),
+            "timestamp": TimestampConverterApp(self, on_back=self.show_home),
         }
         self.show_home()
 
