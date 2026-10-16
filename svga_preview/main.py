@@ -14,6 +14,7 @@ if __package__ in (None, ""):
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 from tkinter import filedialog
+from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP, TkinterDnD
 
 from svga_preview.parser import Movie, SvgaError, load
 from svga_preview.renderer import render_movie
@@ -43,10 +44,12 @@ class App(ctk.CTkFrame):
         self._slider_lock = False
         self._photo = None
         self._resize_job = None
+        self._drag_inside = 0
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
         self._build()
+        self._enable_file_drop()
 
     def pause(self) -> None:
         self._playing = False
@@ -92,7 +95,12 @@ class App(ctk.CTkFrame):
         self.stage.grid(row=0, column=0, sticky="nsew")
         self.stage.grid_columnconfigure(0, weight=1)
         self.stage.grid_rowconfigure(0, weight=1)
-        self.preview = ctk.CTkLabel(self.stage, text="打开一个 SVGA 文件", font=FONT, text_color=("gray30", "gray70"))
+        self.preview = ctk.CTkLabel(
+            self.stage,
+            text="将 SVGA 文件拖到这里，或点击打开文件",
+            font=FONT,
+            text_color=("gray30", "gray70"),
+        )
         self.preview.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         self.stage.bind("<Configure>", self._on_resize)
 
@@ -129,6 +137,68 @@ class App(ctk.CTkFrame):
 
         self.status_label = ctk.CTkLabel(self, text="打开 SVGA 文件后即可播放", font=FONT_SM, anchor="w")
         self.status_label.grid(row=4, column=0, sticky="ew", padx=20, pady=(8, 16))
+
+    def _enable_file_drop(self) -> None:
+        TkinterDnD._require(self.winfo_toplevel())
+        self._stage_border_width = self.stage.cget("border_width")
+        self._stage_border_color = self.stage.cget("border_color")
+        for widget in self._drop_surfaces():
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<DropEnter>>", self._on_drop_enter)
+            widget.dnd_bind("<<DropPosition>>", self._on_drop_position)
+            widget.dnd_bind("<<DropLeave>>", self._on_drop_leave)
+            widget.dnd_bind("<<Drop>>", self._on_drop)
+
+    def _drop_surfaces(self):
+        stage = self.stage
+        preview = self.preview
+        surfaces = [
+            stage,
+            getattr(stage, "_canvas", None),
+            preview,
+            getattr(preview, "_canvas", None),
+            getattr(preview, "_label", None),
+        ]
+        return [widget for widget in surfaces if widget is not None]
+
+    def _on_drop_enter(self, _event):
+        if self._loading:
+            return REFUSE_DROP
+        self._drag_inside += 1
+        self._set_drop_highlight(True)
+        return COPY
+
+    def _on_drop_position(self, _event):
+        if self._loading:
+            return REFUSE_DROP
+        return COPY
+
+    def _on_drop_leave(self, _event) -> None:
+        self._drag_inside = max(0, self._drag_inside - 1)
+        if self._drag_inside == 0:
+            self._set_drop_highlight(False)
+
+    def _on_drop(self, event):
+        self._drag_inside = 0
+        self._set_drop_highlight(False)
+        if self._loading:
+            return REFUSE_DROP
+        try:
+            paths = self.tk.splitlist(event.data)
+        except tkinter.TclError:
+            paths = (event.data,) if event.data else ()
+        chosen = next((path for path in paths if Path(path).suffix.lower() == ".svga"), None)
+        if chosen is None:
+            self._set_status("请拖入 SVGA 文件", error=True)
+            return COPY
+        self._load_path(chosen)
+        return COPY
+
+    def _set_drop_highlight(self, active: bool) -> None:
+        if active:
+            self.stage.configure(border_width=2, border_color=("#1f6aa5", "#3b8ed0"))
+            return
+        self.stage.configure(border_width=self._stage_border_width, border_color=self._stage_border_color)
 
     def _open(self) -> None:
         chosen = filedialog.askopenfilename(
