@@ -21,6 +21,41 @@ STATUS_OK = ("gray20", "gray80")
 STATUS_ERROR = ("#c62828", "#ef9a9a")
 
 
+def quoted_content_span(line: str, column: int) -> tuple[int, int] | None:
+    """双击落在当前行的 JSON 字符串上时，返回引号内内容的半开区间。"""
+    if column < 0:
+        return None
+    quotes: list[int] = []
+    for index, char in enumerate(line):
+        if char != '"':
+            continue
+        slashes = 0
+        cursor = index - 1
+        while cursor >= 0 and line[cursor] == "\\":
+            slashes += 1
+            cursor -= 1
+        if slashes % 2 == 0:
+            quotes.append(index)
+    for open_at, close_at in zip(quotes[0::2], quotes[1::2]):
+        if open_at <= column <= close_at:
+            return open_at + 1, close_at
+    return None
+
+
+def _select_quoted_on_double_click(event):
+    widget = event.widget
+    line_no, column = widget.index(f"@{event.x},{event.y}").split(".")
+    line = widget.get(f"{line_no}.0", f"{line_no}.end")
+    span = quoted_content_span(line, int(column))
+    if span is None:
+        return None
+    start, end = span
+    widget.tag_remove("sel", "1.0", "end")
+    widget.tag_add("sel", f"{line_no}.{start}", f"{line_no}.{end}")
+    widget.mark_set("insert", f"{line_no}.{end}")
+    return "break"
+
+
 class App(ctk.CTkFrame):
     def __init__(self, master, on_back=None) -> None:
         super().__init__(master, fg_color="transparent")
@@ -66,6 +101,8 @@ class App(ctk.CTkFrame):
         self.input_box.grid(row=1, column=0, sticky="nsew")
         self.output_box = ctk.CTkTextbox(editors, font=FONT_CODE, wrap="none", undo=True)
         self.output_box.grid(row=1, column=1, sticky="nsew", padx=(12, 0))
+        self.input_box.bind("<Double-Button-1>", _select_quoted_on_double_click)
+        self.output_box.bind("<Double-Button-1>", _select_quoted_on_double_click)
 
         self.status_label = ctk.CTkLabel(self, text="粘贴 JSON，或打开文件后格式化", font=FONT_SM, anchor="w")
         self.status_label.grid(row=3, column=0, sticky="ew", padx=20, pady=(8, 16))
