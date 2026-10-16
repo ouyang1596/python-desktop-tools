@@ -45,6 +45,9 @@ class FoldingTextbox(ctk.CTkTextbox):
         self._gutter.bind("<Motion>", self._on_gutter_motion)
         self._gutter.bind("<MouseWheel>", self._on_gutter_wheel)
         self._textbox.bind("<Configure>", self._schedule_redraw, add="+")
+        self._textbox.bind("<Button-1>", self._on_text_click, add="+")
+        self._textbox.bind("<Motion>", self._on_text_motion, add="+")
+        self._textbox.bind("<Leave>", self._on_text_leave, add="+")
         self._gutter.bind("<Configure>", self._schedule_redraw)
         self._sync_gutter_colors()
 
@@ -268,6 +271,31 @@ class FoldingTextbox(ctk.CTkTextbox):
         if text_y < top or text_y >= top + height:
             return None
         return fold
+
+    def _collapsed_fold_at_index(self, index: str) -> Fold | None:
+        line = int(str(index).split(".")[0])
+        fold = self._folds_by_line.get(line)
+        if fold is not None and fold.key in self._collapsed and not self._is_hidden(fold):
+            return fold
+        for item in self._active_collapsed():
+            if item.end_line == line:
+                return item
+        return None
+
+    def _on_text_click(self, event):
+        fold = self._collapsed_fold_at_index(self._textbox.index(f"@{event.x},{event.y}"))
+        if fold is None:
+            return None
+        self._collapsed.discard(fold.key)
+        self._render()
+        return "break"
+
+    def _on_text_motion(self, event) -> None:
+        fold = self._collapsed_fold_at_index(self._textbox.index(f"@{event.x},{event.y}"))
+        self._textbox.configure(cursor="hand2" if fold else "xterm")
+
+    def _on_text_leave(self, _event) -> None:
+        self._textbox.configure(cursor="xterm")
 
     def _on_gutter_click(self, event) -> None:
         fold = self._fold_at_y(event.y)
