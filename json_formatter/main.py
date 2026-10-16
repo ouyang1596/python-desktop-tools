@@ -103,6 +103,7 @@ class App(ctk.CTkFrame):
         self.output_box.grid(row=1, column=1, sticky="nsew", padx=(12, 0))
         self.input_box.bind("<Double-Button-1>", _select_quoted_on_double_click)
         self.output_box.bind("<Double-Button-1>", _select_quoted_on_double_click)
+        self._lock_output()
 
         self.status_label = ctk.CTkLabel(self, text="粘贴 JSON，或打开文件后格式化", font=FONT_SM, anchor="w")
         self.status_label.grid(row=3, column=0, sticky="ew", padx=20, pady=(8, 16))
@@ -124,7 +125,7 @@ class App(ctk.CTkFrame):
             self._set_status(f"无法读取文件：{err}", error=True)
             return
         self._set_text(self.input_box, text)
-        self._set_text(self.output_box, "")
+        self._set_output("")
         self._set_status(f"已打开 {path.name}")
 
     def _format(self) -> None:
@@ -139,7 +140,7 @@ class App(ctk.CTkFrame):
         except FormatError as err:
             self._set_status(str(err), error=True)
             return
-        self._set_text(self.output_box, result)
+        self._set_output(result)
         self._set_status(success)
 
     def _copy_result(self) -> None:
@@ -176,6 +177,16 @@ class App(ctk.CTkFrame):
 
     def _set_status(self, message: str, *, error: bool = False) -> None:
         self.status_label.configure(text=message, text_color=STATUS_ERROR if error else STATUS_OK)
+
+    def _set_output(self, text: str) -> None:
+        self.output_box.configure(state="normal")
+        try:
+            self._set_text(self.output_box, text)
+        finally:
+            self._lock_output()
+
+    def _lock_output(self) -> None:
+        self.output_box.configure(state="disabled")
 
     @staticmethod
     def _text(widget: ctk.CTkTextbox) -> str:
