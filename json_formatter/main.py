@@ -62,9 +62,9 @@ class App(ctk.CTkFrame):
 
         ctk.CTkLabel(editors, text="输入", font=FONT, anchor="w").grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ctk.CTkLabel(editors, text="结果", font=FONT, anchor="w").grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=(0, 6))
-        self.input_box = ctk.CTkTextbox(editors, font=FONT_CODE, wrap="none")
+        self.input_box = ctk.CTkTextbox(editors, font=FONT_CODE, wrap="none", undo=True)
         self.input_box.grid(row=1, column=0, sticky="nsew")
-        self.output_box = ctk.CTkTextbox(editors, font=FONT_CODE, wrap="none")
+        self.output_box = ctk.CTkTextbox(editors, font=FONT_CODE, wrap="none", undo=True)
         self.output_box.grid(row=1, column=1, sticky="nsew", padx=(12, 0))
 
         self.status_label = ctk.CTkLabel(self, text="粘贴 JSON，或打开文件后格式化", font=FONT_SM, anchor="w")
@@ -146,8 +146,14 @@ class App(ctk.CTkFrame):
 
     @staticmethod
     def _set_text(widget: ctk.CTkTextbox, text: str) -> None:
-        widget.delete("1.0", "end")
-        widget.insert("1.0", text)
+        widget.configure(autoseparators=False)
+        try:
+            widget.edit_separator()
+            widget.delete("1.0", "end")
+            widget.insert("1.0", text)
+            widget.edit_separator()
+        finally:
+            widget.configure(autoseparators=True)
 
 
 def main() -> None:
