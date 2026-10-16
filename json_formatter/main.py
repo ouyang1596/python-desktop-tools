@@ -11,6 +11,7 @@ if __package__ in (None, ""):
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
+from json_formatter.folding_box import FoldingTextbox
 from json_formatter.formatter import FormatError, format_json, minify_json
 
 FONT = ("Microsoft YaHei UI", 13)
@@ -62,6 +63,7 @@ class App(ctk.CTkFrame):
         ctk.set_appearance_mode("system")
         ctk.set_default_color_theme("blue")
         self._on_back = on_back
+        self._result_text = ""
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
@@ -99,7 +101,7 @@ class App(ctk.CTkFrame):
         ctk.CTkLabel(editors, text="结果", font=FONT, anchor="w").grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=(0, 6))
         self.input_box = ctk.CTkTextbox(editors, font=FONT_CODE, wrap="none", undo=True)
         self.input_box.grid(row=1, column=0, sticky="nsew")
-        self.output_box = ctk.CTkTextbox(editors, font=FONT_CODE, wrap="none", undo=True)
+        self.output_box = FoldingTextbox(editors, font=FONT_CODE, wrap="none", undo=True)
         self.output_box.grid(row=1, column=1, sticky="nsew", padx=(12, 0))
         self.input_box.bind("<Double-Button-1>", _select_quoted_on_double_click)
         self.output_box.bind("<Double-Button-1>", _select_quoted_on_double_click)
@@ -144,7 +146,7 @@ class App(ctk.CTkFrame):
         self._set_status(success)
 
     def _copy_result(self) -> None:
-        text = self._text(self.output_box)
+        text = self._result_text
         if not text.strip():
             self._set_status("没有可复制的内容", error=True)
             return
@@ -153,7 +155,7 @@ class App(ctk.CTkFrame):
         self._set_status("已复制")
 
     def _save_file(self) -> None:
-        text = self._text(self.output_box)
+        text = self._result_text
         if not text.strip():
             messagebox.showwarning("提示", "请先格式化，右侧还没有结果。")
             return
@@ -179,9 +181,10 @@ class App(ctk.CTkFrame):
         self.status_label.configure(text=message, text_color=STATUS_ERROR if error else STATUS_OK)
 
     def _set_output(self, text: str) -> None:
+        self._result_text = text
         self.output_box.configure(state="normal")
         try:
-            self._set_text(self.output_box, text)
+            self.output_box.set_document(text)
         finally:
             self._lock_output()
 
