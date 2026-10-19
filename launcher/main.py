@@ -10,6 +10,7 @@ if __package__ in (None, ""):
 
 import customtkinter as ctk
 
+from anim_preview.main import App as AnimPreviewApp
 from image_compressor.main import App as ImageCompressorApp
 from json_formatter.main import App as JsonFormatterApp
 from svga_preview.main import App as SvgaPreviewApp
@@ -35,6 +36,11 @@ TOOLS = (
         "key": "svga",
         "title": "SVGA 预览",
         "description": "播放 SVGA 动画，查看画布和帧信息",
+    },
+    {
+        "key": "anim",
+        "title": "动图播放",
+        "description": "播放 GIF、动画 WebP",
     },
     {
         "key": "timestamp",
@@ -101,7 +107,7 @@ class Shell(ctk.CTk):
         ctk.set_default_color_theme("blue")
         self.title(HOME_TITLE)
         self.geometry("980x680")
-        self.minsize(860, 560)
+        self.minsize(860, 640)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
@@ -111,6 +117,7 @@ class Shell(ctk.CTk):
             "image": ImageCompressorApp(self, on_back=self.show_home),
             "json": JsonFormatterApp(self, on_back=self.show_home),
             "svga": SvgaPreviewApp(self, on_back=self.show_home),
+            "anim": AnimPreviewApp(self, on_back=self.show_home),
             "timestamp": TimestampConverterApp(self, on_back=self.show_home),
         }
         self.show_home()
