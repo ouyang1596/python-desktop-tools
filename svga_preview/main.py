@@ -410,11 +410,14 @@ class App(ctk.CTkFrame):
 
 def _fit_frame(frame: Image.Image, width: int, height: int, dark: bool) -> Image.Image:
     board = _checkerboard(width, height, dark)
-    scale = min(width / frame.width, height / frame.height)
-    resized = frame.resize(
-        (max(1, int(frame.width * scale)), max(1, int(frame.height * scale))),
-        Image.Resampling.BILINEAR,
-    )
+    scale = min(1.0, width / frame.width, height / frame.height)
+    if scale < 1:
+        resized = frame.resize(
+            (max(1, int(frame.width * scale)), max(1, int(frame.height * scale))),
+            Image.Resampling.BILINEAR,
+        )
+    else:
+        resized = frame
     x = (width - resized.width) // 2
     y = (height - resized.height) // 2
     board.paste(resized, (x, y), resized)

@@ -7,7 +7,6 @@ from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 
-MAX_PREVIEW_EDGE = 960
 _MIN_DURATION = 20
 _FALLBACK_DURATION = 100
 _FORMATS = {".gif": "GIF", ".webp": "WEBP"}
@@ -55,7 +54,7 @@ def load(path: Path | str, on_progress=None) -> Animation:
     if width < 1 or height < 1:
         raise AnimError("图片尺寸无效")
     return Animation(
-        frames=_fit_preview(frames, width, height),
+        frames=frames,
         durations=durations,
         width=width,
         height=height,
@@ -102,11 +101,3 @@ def _loop_count(image: Image.Image) -> int:
     except (TypeError, ValueError):
         return 1
 
-
-def _fit_preview(frames: list[Image.Image], width: int, height: int) -> list[Image.Image]:
-    edge = max(width, height)
-    if edge <= MAX_PREVIEW_EDGE:
-        return frames
-    scale = MAX_PREVIEW_EDGE / edge
-    size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
-    return [frame.resize(size, Image.Resampling.BILINEAR) for frame in frames]

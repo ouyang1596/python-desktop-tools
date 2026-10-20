@@ -10,11 +10,9 @@ from PIL import Image, ImageChops, UnidentifiedImageError
 from svga_preview.parser import Color, Frame, Movie, Shape, Sprite, Transform
 from svga_preview.paths import fill_contours, parse_contours, stroke_contours
 
-MAX_PREVIEW_EDGE = 960
-
 
 def render_movie(movie: Movie, on_progress=None) -> list[Image.Image]:
-    preview_scale = min(1.0, MAX_PREVIEW_EDGE / max(movie.width, movie.height))
+    preview_scale = 1.0
     size = (
         max(1, int(round(movie.width * preview_scale))),
         max(1, int(round(movie.height * preview_scale))),
