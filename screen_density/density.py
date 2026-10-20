@@ -74,6 +74,8 @@ _UNAUTHORIZED = "手机未授权，请在手机上允许 USB 调试"
 _OFFLINE = "设备离线"
 _TIMEOUT = "查询超时，请确认手机已解锁并允许 USB 调试"
 _INSTALL_TIMEOUT = "安装超时"
+_PUSH_TIMEOUT = "复制超时"
+_REMOTE_DIR = "/sdcard"
 _FAILURE = re.compile(r"Failure \[[^\]]+\]")
 
 
@@ -237,6 +239,31 @@ def install_failure_message(text: str) -> str:
     if not lines:
         return "安装失败"
     return f"安装失败：{lines[-1]}"
+
+
+def push_file(serial: str, path: str, *, timeout: float = 300) -> None:
+    """把文件复制到手机的 /sdcard，保留原文件名。同名文件会被覆盖。"""
+    source = Path(path)
+    name = source.name
+    if not source.is_file() or not name or name in {".", ".."}:
+        raise DensityError("请拖入文件")
+    adb = find_adb()
+    stdout, stderr, code = _execute(
+        adb,
+        ["-s", serial, "push", str(source), f"{_REMOTE_DIR}/{name}"],
+        timeout,
+        _PUSH_TIMEOUT,
+    )
+    if code == 0:
+        return
+    raise DensityError(push_failure_message(f"{stdout}\n{stderr}"))
+
+
+def push_failure_message(text: str) -> str:
+    lines = [line.strip() for line in _normalize(text).splitlines() if line.strip()]
+    if not lines:
+        return "复制失败"
+    return f"复制失败：{lines[-1]}"
 
 
 def device_label(device: Device) -> str:

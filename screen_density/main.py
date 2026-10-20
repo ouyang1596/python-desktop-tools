@@ -13,7 +13,7 @@ if __package__ in (None, ""):
 import customtkinter as ctk
 from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP, TkinterDnD
 
-from screen_density.density import DensityError, Device, ProbeResult, ScreenDensity, device_label, install_apk, probe
+from screen_density.density import DensityError, Device, ProbeResult, ScreenDensity, device_label, install_apk, probe, push_file
 
 FONT = ("Microsoft YaHei UI", 13)
 FONT_SM = ("Microsoft YaHei UI", 12)
@@ -51,7 +51,7 @@ class App(ctk.CTkFrame):
         self._install_token = 0
         self._installable = False
         self._install_name = ""
-        self._block_message = "连接手机后，把 apk 拖到这里"
+        self._block_message = "请先连接并授权手机"
         self._drag_inside = 0
         self._suppress_query_status = False
         self._values = {key: "" for key, _title, _copy in _FIELDS}
@@ -127,14 +127,14 @@ class App(ctk.CTkFrame):
         self.device_menu.grid(row=0, column=1, sticky="ew")
         self.device_menu.grid_remove()
 
-        self.drop_zone = ctk.CTkFrame(device, height=72, corner_radius=10, border_width=1, border_color=("gray70", "gray40"))
+        self.drop_zone = ctk.CTkFrame(device, height=88, corner_radius=10, border_width=1, border_color=("gray70", "gray40"))
         self.drop_zone.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
         self.drop_zone.grid_propagate(False)
         self.drop_zone.grid_columnconfigure(0, weight=1)
         self.drop_zone.grid_rowconfigure(0, weight=1)
         self.drop_label = ctk.CTkLabel(
             self.drop_zone,
-            text="连接手机后，把 apk 拖到这里",
+            text="连接手机后，把文件拖到这里",
             font=FONT,
             text_color=("gray30", "gray70"),
             wraplength=720,
@@ -283,11 +283,11 @@ class App(ctk.CTkFrame):
         self._installable = chosen is not None and chosen.state == "device"
         if self._installable and chosen is not None:
             self._install_name = device_label(chosen)
-            text = f"把 apk 拖到这里，安装到 {self._install_name}"
+            text = f"把文件拖到这里：apk 安装到 {self._install_name}，其他文件复制到 /sdcard"
         else:
             self._install_name = ""
             self._block_message = "请先连接并授权手机" if chosen is not None else "没有检测到手机，请打开 USB 调试并连接"
-            text = "连接手机后，把 apk 拖到这里"
+            text = "连接手机后，把文件拖到这里"
         self.drop_label.configure(text=text)
 
     def _enable_file_drop(self) -> None:
@@ -337,9 +337,9 @@ class App(ctk.CTkFrame):
             paths = self.tk.splitlist(event.data)
         except tkinter.TclError:
             paths = (event.data,) if event.data else ()
-        apks = [path for path in paths if Path(path).suffix.lower() == ".apk" and Path(path).is_file()]
-        if not apks:
-            self._set_status("请拖入 apk 文件", error=True, force=True)
+        files = [path for path in paths if Path(path).is_file()]
+        if not files:
+            self._set_status("请拖入文件", error=True, force=True)
             return COPY
         if not self._installable or not self._serial:
             self._set_status(self._block_message, error=True, force=True)
@@ -348,21 +348,27 @@ class App(ctk.CTkFrame):
         token = self._install_token
         serial = self._serial
         name = self._install_name
-        self._set_status("正在安装…", force=True)
-        threading.Thread(target=self._install_files, args=(token, serial, name, tuple(apks)), daemon=True).start()
+        self._set_status(_busy_text(files[0], 1, len(files)), force=True)
+        threading.Thread(target=self._transfer_files, args=(token, serial, name, tuple(files)), daemon=True).start()
         return COPY
 
-    def _install_files(self, token: int, serial: str, name: str, apks: tuple[str, ...]) -> None:
-        message = f"已安装到 {name}"
+    def _transfer_files(self, token: int, serial: str, name: str, files: tuple[str, ...]) -> None:
+        installed = 0
+        copied = 0
+        message = ""
         error = False
         try:
-            total = len(apks)
-            for index, path in enumerate(apks, start=1):
+            total = len(files)
+            for index, path in enumerate(files, start=1):
                 if total > 1:
-                    self._post_status(token, f"正在安装 {index}/{total}…")
-                install_apk(serial, path)
-            if total > 1:
-                message = f"已安装 {total} 个到 {name}"
+                    self._post_status(token, _busy_text(path, index, total))
+                if Path(path).suffix.lower() == ".apk":
+                    install_apk(serial, path)
+                    installed += 1
+                else:
+                    push_file(serial, path)
+                    copied += 1
+            message = _transfer_message(name, installed, copied)
         except DensityError as err:
             message = str(err)
             error = True
@@ -407,6 +413,26 @@ class App(ctk.CTkFrame):
             self.drop_zone.configure(border_width=2, border_color=("#1f6aa5", "#3b8ed0"))
             return
         self.drop_zone.configure(border_width=self._drop_border_width, border_color=self._drop_border_color)
+
+
+def _busy_text(path: str, index: int, total: int) -> str:
+    action = "安装" if Path(path).suffix.lower() == ".apk" else "复制"
+    if total > 1:
+        return f"正在{action} {index}/{total}…"
+    return f"正在{action}…"
+
+
+def _transfer_message(name: str, installed: int, copied: int) -> str:
+    parts: list[str] = []
+    if installed == 1:
+        parts.append(f"已安装到 {name}")
+    elif installed > 1:
+        parts.append(f"已安装 {installed} 个到 {name}")
+    if copied == 1:
+        parts.append(f"已复制到 {name} 的 /sdcard")
+    elif copied > 1:
+        parts.append(f"已复制 {copied} 个到 {name} 的 /sdcard")
+    return "，".join(parts)
 
 
 def _device_choices(devices: tuple[Device, ...]) -> list[tuple[str, str]]:
