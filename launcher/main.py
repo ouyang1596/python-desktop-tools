@@ -14,6 +14,7 @@ from anim_preview.main import App as AnimPreviewApp
 from color_converter.main import App as ColorConverterApp
 from image_compressor.main import App as ImageCompressorApp
 from json_formatter.main import App as JsonFormatterApp
+from screen_density.main import App as ScreenDensityApp
 from svga_preview.main import App as SvgaPreviewApp
 from timestamp_converter.main import App as TimestampConverterApp
 
@@ -52,6 +53,11 @@ TOOLS = (
         "key": "color",
         "title": "颜色转换",
         "description": "十六进制、RGB 与透明度互转",
+    },
+    {
+        "key": "density",
+        "title": "屏幕密度",
+        "description": "查看已连接手机是 xh 还是 xxh",
     },
 )
 
@@ -112,8 +118,8 @@ class Shell(ctk.CTk):
         ctk.set_appearance_mode("system")
         ctk.set_default_color_theme("blue")
         self.title(HOME_TITLE)
-        self.geometry("980x680")
-        self.minsize(860, 640)
+        self.geometry("980x820")
+        self.minsize(860, 760)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
@@ -126,6 +132,7 @@ class Shell(ctk.CTk):
             "anim": AnimPreviewApp(self, on_back=self.show_home),
             "timestamp": TimestampConverterApp(self, on_back=self.show_home),
             "color": ColorConverterApp(self, on_back=self.show_home),
+            "density": ScreenDensityApp(self, on_back=self.show_home),
         }
         self.show_home()
 

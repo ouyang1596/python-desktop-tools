@@ -9,7 +9,7 @@ pip install -r requirements.txt
 python -m launcher
 ```
 
-主界面用网格列出图片压缩、JSON 格式化、SVGA 预览、动图播放、时间戳转换和颜色转换，点击卡片进入对应工具，点「返回」回到主界面。
+主界面用网格列出图片压缩、JSON 格式化、SVGA 预览、动图播放、时间戳转换、颜色转换和屏幕密度，点击卡片进入对应工具，点「返回」回到主界面。
 
 ## 图片压缩
 
@@ -92,3 +92,17 @@ python -m color_converter
 输入支持 `#RGB`、`#ARGB`、`#RRGGBB`、`#AARRGGBB`（可以不写 `#`）、`0x` 加 6 位或 8 位、`Color.parseColor("...")`、`rgb()` 和 `rgba()`。短写按 Android 规则展开：`#RGB` 透明度为 `FF`，`#ARGB` 每位数字重复一次。`rgba` 的透明度写 `50%` 按百分比，带小数点按 0 到 1，大于 1 的整数按 0 到 255。
 
 结果给出 `#AARRGGBB`、`#RRGGBB`、`Color.parseColor`、`0xAARRGGBB`、RGB 分量和透明度，可以分别复制。色块叠在棋盘格上，能看出透明度。拖动滑块或在输入框填写 0 到 100 的整数后回车，只改透明度。
+
+## 屏幕密度
+
+查看已连接 Android 手机的屏幕密度，并标出资源目录档位。320 dpi 显示为 xh（xhdpi），480 dpi 显示为 xxh（xxhdpi）。手机改过显示大小时，以覆盖密度为准。
+
+### 启动
+
+```bash
+python -m screen_density
+```
+
+需要本机能运行 `adb`。程序会依次查找 PATH、`ANDROID_HOME`、`ANDROID_SDK_ROOT`，以及 `%LOCALAPPDATA%\Android\Sdk\platform-tools`。手机需打开 USB 调试并授权。
+
+进入页面或点「刷新」后查询。多台手机时从下拉框切换，名称后面带设备 ID。结果包含当前档位、目录名、当前密度、物理密度、倍数、分辨率、宽高 dp、型号和设备 ID。当前档位、当前密度和设备 ID 可以复制。未连接、未授权或找不到 adb 时，底部状态栏会说明原因。从主界面进入时，点「返回」会丢弃尚未返回的查询结果。
