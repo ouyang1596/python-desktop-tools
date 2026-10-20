@@ -56,7 +56,7 @@ TOOLS = (
     },
     {
         "key": "density",
-        "title": "屏幕密度",
+        "title": "ADB",
         "description": "查看 xh/xxh，拖入 apk 安装到该手机",
     },
 )

@@ -41,6 +41,7 @@ class ScreenDensity:
     scale: str
     size_text: str
     dp_text: str
+    android_version: str
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,8 @@ def screen_from_outputs(
     size_text: str,
     manufacturer: str,
     model: str,
+    release: str = "",
+    sdk: str = "",
 ) -> ScreenDensity:
     physical_dpi, override_dpi = parse_density(density_text)
     overridden = override_dpi is not None and override_dpi != physical_dpi
@@ -168,6 +171,7 @@ def screen_from_outputs(
         scale=format_scale(current_dpi),
         size_text=_size_text(current_size, physical_size if size_overridden else None),
         dp_text=_dp_text(current_size, current_dpi),
+        android_version=_android_version(release, sdk),
     )
 
 
@@ -250,12 +254,14 @@ def _read_screen(adb: str, serial: str, timeout: float) -> ScreenDensity:
         f"wm density; echo {_SPLIT}; "
         f"wm size; echo {_SPLIT}; "
         f"getprop ro.product.manufacturer; echo {_SPLIT}; "
-        "getprop ro.product.model"
+        f"getprop ro.product.model; echo {_SPLIT}; "
+        f"getprop ro.build.version.release; echo {_SPLIT}; "
+        "getprop ro.build.version.sdk"
     )
     parts = _run(adb, ["-s", serial, "shell", command], timeout).split(_SPLIT)
-    if len(parts) < 4:
+    if len(parts) < 6:
         raise DensityError("无法读取屏幕密度")
-    return screen_from_outputs(serial, parts[0], parts[1], parts[2], parts[3])
+    return screen_from_outputs(serial, parts[0], parts[1], parts[2], parts[3], parts[4], parts[5])
 
 
 def _run(adb: str, args: list[str], timeout: float) -> str:
@@ -359,6 +365,18 @@ def _display_block(text: str, display_id: int) -> str:
         return text[match.end() : end]
     end = matches[1].start() if len(matches) > 1 else len(text)
     return text[matches[0].end() : end]
+
+
+def _android_version(release: str, sdk: str) -> str:
+    name = " ".join(release.split())
+    level = " ".join(sdk.split())
+    if name and level:
+        return f"{name}（API {level}）"
+    if name:
+        return name
+    if level:
+        return f"API {level}"
+    return ""
 
 
 def _model_name(manufacturer: str, model: str) -> str:

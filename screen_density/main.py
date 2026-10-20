@@ -19,7 +19,6 @@ FONT = ("Microsoft YaHei UI", 13)
 FONT_SM = ("Microsoft YaHei UI", 12)
 FONT_TITLE = ("Microsoft YaHei UI", 20)
 FONT_CODE = ("Consolas", 13)
-FONT_RESULT = ("Microsoft YaHei UI", 36)
 STATUS_OK = ("gray20", "gray80")
 STATUS_ERROR = ("#c62828", "#ef9a9a")
 VALUE_COLOR = ("gray10", "gray90")
@@ -32,6 +31,7 @@ _FIELDS = (
     ("size", "分辨率", False),
     ("dp", "宽高 dp", False),
     ("model", "型号", False),
+    ("android", "Android 版本", False),
     ("serial", "设备 ID", True),
 )
 
@@ -54,7 +54,7 @@ class App(ctk.CTkFrame):
         self._block_message = "连接手机后，把 apk 拖到这里"
         self._drag_inside = 0
         self._suppress_query_status = False
-        self._values = {"short": "", **{key: "" for key, _title, _copy in _FIELDS}}
+        self._values = {key: "" for key, _title, _copy in _FIELDS}
         self._labels: dict[str, ctk.CTkLabel] = {}
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -101,7 +101,7 @@ class App(ctk.CTkFrame):
         header.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 8))
         if self._on_back is not None:
             ctk.CTkButton(header, text="返回", width=72, command=self._on_back).pack(side="left", padx=(0, 12))
-        ctk.CTkLabel(header, text="屏幕密度", font=FONT_TITLE).pack(side="left")
+        ctk.CTkLabel(header, text="ADB", font=FONT_TITLE).pack(side="left")
         self.refresh_button = ctk.CTkButton(header, text="刷新", width=72, command=self.refresh)
         self.refresh_button.pack(side="right")
 
@@ -145,22 +145,13 @@ class App(ctk.CTkFrame):
         self._enable_file_drop()
 
         result = self._card(body, 1, "结果")
-        summary = ctk.CTkFrame(result, fg_color="transparent")
-        summary.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 4))
-        summary.grid_columnconfigure(0, weight=1)
-        self.short_label = ctk.CTkLabel(summary, text="—", font=FONT_RESULT, anchor="w", text_color=EMPTY_COLOR)
-        self.short_label.grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(summary, text="复制", width=64, height=28, command=lambda: self._copy("short")).grid(
-            row=0, column=1, sticky="e"
-        )
-
         lines = ctk.CTkFrame(result, fg_color="transparent")
-        lines.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 12))
+        lines.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
         lines.grid_columnconfigure(1, weight=1)
         for index, (key, title, copy) in enumerate(_FIELDS):
             bottom = index == len(_FIELDS) - 1
             pady = (0, 8 if bottom else 4)
-            ctk.CTkLabel(lines, text=title, font=FONT, anchor="w", width=88).grid(row=index, column=0, sticky="w", pady=pady)
+            ctk.CTkLabel(lines, text=title, font=FONT, anchor="w", width=120).grid(row=index, column=0, sticky="w", pady=pady)
             label = ctk.CTkLabel(lines, text="—", font=FONT_CODE, anchor="w", text_color=EMPTY_COLOR)
             label.grid(row=index, column=1, sticky="ew", padx=8, pady=pady)
             self._labels[key] = label
@@ -251,7 +242,6 @@ class App(ctk.CTkFrame):
         self.device_menu.grid(row=0, column=1, sticky="ew")
 
     def _show_screen(self, screen: ScreenDensity) -> None:
-        self._set_value("short", screen.short, prominent=True)
         self._set_value("qualifier", screen.qualifier)
         self._set_value("dpi", f"{screen.current_dpi} dpi")
         self._set_value("physical_dpi", f"{screen.physical_dpi} dpi")
@@ -259,10 +249,10 @@ class App(ctk.CTkFrame):
         self._set_value("size", screen.size_text)
         self._set_value("dp", screen.dp_text)
         self._set_value("model", screen.model)
+        self._set_value("android", screen.android_version)
         self._set_value("serial", screen.serial)
 
     def _clear_results(self) -> None:
-        self._set_value("short", "", prominent=True)
         for key, _title, _copy in _FIELDS:
             self._set_value(key, "")
 
@@ -275,9 +265,9 @@ class App(ctk.CTkFrame):
         self.clipboard_append(text)
         self._set_status("已复制", force=True)
 
-    def _set_value(self, key: str, text: str, *, prominent: bool = False) -> None:
+    def _set_value(self, key: str, text: str) -> None:
         self._values[key] = text
-        label = self.short_label if prominent else self._labels[key]
+        label = self._labels[key]
         if text:
             label.configure(text=text, text_color=VALUE_COLOR)
             return
@@ -433,7 +423,7 @@ def _device_choices(devices: tuple[Device, ...]) -> list[tuple[str, str]]:
 
 def main() -> None:
     root = ctk.CTk()
-    root.title("屏幕密度")
+    root.title("ADB")
     root.geometry("980x680")
     root.minsize(860, 560)
     root.grid_columnconfigure(0, weight=1)
