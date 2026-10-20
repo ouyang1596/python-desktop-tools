@@ -7,7 +7,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
@@ -52,6 +54,17 @@ class ProbeResult:
     error: bool
 
 
+@dataclass(frozen=True)
+class Recording:
+    """正在进行的录屏。remote 是手机上的临时文件。"""
+
+    serial: str
+    remote: str
+    process: subprocess.Popen[bytes]
+    errors: bytearray
+    reader: threading.Thread
+
+
 _BUCKETS = (
     (120, "ldpi", "ldpi"),
     (160, "mdpi", "mdpi"),
@@ -77,6 +90,12 @@ _INSTALL_TIMEOUT = "安装超时"
 _PUSH_TIMEOUT = "复制超时"
 _REMOTE_DIR = "/sdcard"
 _FAILURE = re.compile(r"Failure \[[^\]]+\]")
+SAVE_DIR = Path(r"D:\adb")
+_PNG_MAGIC = b"\x89PNG"
+_RECORD_LIMIT_SECONDS = "180"
+_SCREENSHOT_TIMEOUT = "截屏超时"
+_SAVE_TIMEOUT = "保存超时"
+_RECORD_TIMEOUT = "停止录屏超时"
 
 
 def bucket_for(dpi: int) -> tuple[str, str]:
@@ -266,6 +285,77 @@ def push_failure_message(text: str) -> str:
     return f"复制失败：{lines[-1]}"
 
 
+def capture_screenshot(serial: str, *, timeout: float = 30) -> Path:
+    """截取当前画面并保存为 PNG，返回本机路径。"""
+    adb = find_adb()
+    data, stderr, _code = _execute_binary(
+        adb,
+        ["-s", serial, "exec-out", "screencap", "-p"],
+        timeout,
+        _SCREENSHOT_TIMEOUT,
+    )
+    if data.startswith(_PNG_MAGIC):
+        return _write_bytes(_reserve_path("截屏", ".png"), data)
+    return _screenshot_via_pull(adb, serial, timeout, stderr)
+
+
+def start_recording(serial: str) -> Recording:
+    """开始录屏。最长 3 分钟，到时手机上的 screenrecord 会自己退出。"""
+    adb = find_adb()
+    remote = _remote_temp(".mp4")
+    process = _popen(
+        adb,
+        ["-s", serial, "shell", "screenrecord", "--time-limit", _RECORD_LIMIT_SECONDS, remote],
+    )
+    errors = bytearray()
+    reader = threading.Thread(target=_read_stream, args=(process.stderr, errors), daemon=True)
+    reader.start()
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        return Recording(serial=serial, remote=remote, process=process, errors=errors, reader=reader)
+    reader.join(timeout=1)
+    raise DensityError(_capture_failure(errors.decode("utf-8", errors="replace"), "录屏失败"))
+
+
+def stop_recording(recording: Recording, *, timeout: float = 30) -> Path:
+    """结束录屏，把视频拉到本机后删除手机上的临时文件。进程已退出时直接拉取。"""
+    adb = find_adb()
+    try:
+        _stop_record_process(recording, adb, timeout)
+        recording.reader.join(timeout=1)
+        local = _reserve_path("录屏", ".mp4")
+        _pull_file(adb, recording.serial, recording.remote, local, timeout)
+        if _is_mp4(local):
+            return local
+        local.unlink(missing_ok=True)
+        detail = recording.errors.decode("utf-8", errors="replace")
+        raise DensityError(_capture_failure(detail, "录屏失败"))
+    finally:
+        _remove_remote(adb, recording.serial, recording.remote)
+
+
+def _stop_record_process(recording: Recording, adb: str, timeout: float) -> None:
+    process = recording.process
+    if process.poll() is not None:
+        return
+    try:
+        _execute(
+            adb,
+            ["-s", recording.serial, "shell", "kill -2 $(pidof screenrecord)"],
+            10,
+            _RECORD_TIMEOUT,
+        )
+    except DensityError:
+        pass
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+        raise DensityError(_RECORD_TIMEOUT) from None
+
+
 def device_label(device: Device) -> str:
     if device.model:
         name = f"{device.model.replace('_', ' ')} {device.serial}"
@@ -317,6 +407,149 @@ def _execute(adb: str, args: list[str], timeout: float, timeout_message: str) ->
     stdout = _normalize(completed.stdout.decode("utf-8", errors="replace"))
     stderr = _normalize(completed.stderr.decode("utf-8", errors="replace"))
     return stdout, stderr, completed.returncode
+
+
+def _execute_binary(adb: str, args: list[str], timeout: float, timeout_message: str) -> tuple[bytes, str, int]:
+    """执行 adb 并保留原始标准输出，供截屏这类二进制结果使用。"""
+    kwargs: dict = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        completed = subprocess.run(
+            [adb, *args],
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            **kwargs,
+        )
+    except subprocess.TimeoutExpired:
+        raise DensityError(timeout_message) from None
+    except OSError:
+        raise DensityError("无法启动 adb") from None
+    stderr = _normalize(completed.stderr.decode("utf-8", errors="replace"))
+    return completed.stdout, stderr, completed.returncode
+
+
+def _popen(adb: str, args: list[str]) -> subprocess.Popen[bytes]:
+    kwargs: dict = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        return subprocess.Popen(
+            [adb, *args],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            **kwargs,
+        )
+    except OSError:
+        raise DensityError("无法启动 adb") from None
+
+
+def _read_stream(stream, sink: bytearray) -> None:
+    if stream is None:
+        return
+    sink.extend(stream.read())
+
+
+def _screenshot_via_pull(adb: str, serial: str, timeout: float, prior_error: str) -> Path:
+    remote = _remote_temp(".png")
+    try:
+        stdout, stderr, code = _execute(
+            adb,
+            ["-s", serial, "shell", "screencap", "-p", remote],
+            timeout,
+            _SCREENSHOT_TIMEOUT,
+        )
+        if code != 0:
+            detail = stderr or stdout or prior_error
+            raise DensityError(_capture_failure(detail, "截屏失败"))
+        local = _reserve_path("截屏", ".png")
+        _pull_file(adb, serial, remote, local, timeout)
+        if not _is_png_file(local):
+            local.unlink(missing_ok=True)
+            raise DensityError(_capture_failure(prior_error, "截屏失败"))
+        return local
+    finally:
+        _remove_remote(adb, serial, remote)
+
+
+def _pull_file(adb: str, serial: str, remote: str, local: Path, timeout: float) -> None:
+    stdout, stderr, code = _execute(
+        adb,
+        ["-s", serial, "pull", remote, str(local)],
+        timeout,
+        _SAVE_TIMEOUT,
+    )
+    if code == 0 and local.is_file() and local.stat().st_size > 0:
+        return
+    local.unlink(missing_ok=True)
+    raise DensityError(_pull_failure_message(f"{stdout}\n{stderr}"))
+
+
+def _pull_failure_message(text: str) -> str:
+    lines = [line.strip() for line in _normalize(text).splitlines() if line.strip()]
+    if not lines:
+        return "保存失败"
+    return f"保存失败：{lines[-1]}"
+
+
+def _remove_remote(adb: str, serial: str, remote: str) -> None:
+    try:
+        _execute(adb, ["-s", serial, "shell", "rm", "-f", remote], 10, "保存失败")
+    except DensityError:
+        return
+
+
+def _remote_temp(suffix: str) -> str:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"{_REMOTE_DIR}/python-desktop-tools-{stamp}{suffix}"
+
+
+def _reserve_path(kind: str, suffix: str) -> Path:
+    """占一个不重名的本地文件。同一秒已有文件时追加 _2、_3。"""
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    names = [f"{kind}_{stamp}{suffix}"]
+    names.extend(f"{kind}_{stamp}_{index}{suffix}" for index in range(2, 100))
+    for name in names:
+        path = SAVE_DIR / name
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return path
+    raise DensityError("无法保存文件")
+
+
+def _write_bytes(path: Path, data: bytes) -> Path:
+    path.write_bytes(data)
+    return path
+
+
+def _is_png_file(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(len(_PNG_MAGIC)).startswith(_PNG_MAGIC)
+    except OSError:
+        return False
+
+
+def _is_mp4(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return b"ftyp" in handle.read(32)
+    except OSError:
+        return False
+
+
+def _capture_failure(text: str, fallback: str) -> str:
+    cleaned = _clean_adb_error(text.strip())
+    if cleaned in {_UNAUTHORIZED, _OFFLINE, _NO_DEVICE, "没有 USB 调试权限"}:
+        return cleaned
+    if not text.strip() or cleaned == "adb 执行失败":
+        return fallback
+    return f"{fallback}：{cleaned.splitlines()[0]}"
 
 
 def _adb_candidates() -> list[Path]:

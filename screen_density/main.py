@@ -13,7 +13,20 @@ if __package__ in (None, ""):
 import customtkinter as ctk
 from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP, TkinterDnD
 
-from screen_density.density import DensityError, Device, ProbeResult, ScreenDensity, device_label, install_apk, probe, push_file
+from screen_density.density import (
+    SAVE_DIR,
+    DensityError,
+    Device,
+    ProbeResult,
+    ScreenDensity,
+    capture_screenshot,
+    device_label,
+    install_apk,
+    probe,
+    push_file,
+    start_recording,
+    stop_recording,
+)
 
 FONT = ("Microsoft YaHei UI", 13)
 FONT_SM = ("Microsoft YaHei UI", 12)
@@ -49,6 +62,11 @@ class App(ctk.CTkFrame):
         self._by_label: dict[str, str] = {}
         self._installing = False
         self._install_token = 0
+        self._capturing = False
+        self._capture_token = 0
+        self._recording = False
+        self._record_stopping = False
+        self._record_stop = threading.Event()
         self._installable = False
         self._install_name = ""
         self._block_message = "请先连接并授权手机"
@@ -62,9 +80,12 @@ class App(ctk.CTkFrame):
         self.bind("<Destroy>", self._on_destroy)
 
     def pause(self) -> None:
-        """离开页面时丢弃尚未返回的查询结果。"""
+        """离开页面时丢弃尚未返回的查询结果，并停止录屏。"""
         self._token += 1
         self._install_token += 1
+        self._capture_token += 1
+        self._capturing = False
+        self._record_stop.set()
         self._cancel_arm()
 
     def grid(self, *args, **kwargs):
@@ -127,8 +148,17 @@ class App(ctk.CTkFrame):
         self.device_menu.grid(row=0, column=1, sticky="ew")
         self.device_menu.grid_remove()
 
+        actions = ctk.CTkFrame(device, fg_color="transparent")
+        actions.grid(row=2, column=0, sticky="w", padx=16, pady=(0, 8))
+        self.screenshot_button = ctk.CTkButton(
+            actions, text="截屏", width=88, command=self._on_screenshot, state="disabled"
+        )
+        self.screenshot_button.pack(side="left")
+        self.record_button = ctk.CTkButton(actions, text="录屏", width=88, command=self._on_record, state="disabled")
+        self.record_button.pack(side="left", padx=(8, 0))
+
         self.drop_zone = ctk.CTkFrame(device, height=88, corner_radius=10, border_width=1, border_color=("gray70", "gray40"))
-        self.drop_zone.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self.drop_zone.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 14))
         self.drop_zone.grid_propagate(False)
         self.drop_zone.grid_columnconfigure(0, weight=1)
         self.drop_zone.grid_rowconfigure(0, weight=1)
@@ -176,7 +206,7 @@ class App(ctk.CTkFrame):
         serial = self._serial
         self.refresh_button.configure(state="disabled")
         self._clear_results()
-        if not self._installing:
+        if not self._installing and not self._recording:
             self._suppress_query_status = False
             self._set_status("正在查询…")
         threading.Thread(target=self._query, args=(token, serial), daemon=True).start()
@@ -274,7 +304,7 @@ class App(ctk.CTkFrame):
         label.configure(text="—", text_color=EMPTY_COLOR)
 
     def _set_status(self, message: str, *, error: bool = False, force: bool = False) -> None:
-        if not force and (self._installing or self._suppress_query_status):
+        if not force and (self._installing or self._recording or self._capturing or self._suppress_query_status):
             return
         self.status_label.configure(text=message, text_color=STATUS_ERROR if error else STATUS_OK)
 
@@ -289,6 +319,15 @@ class App(ctk.CTkFrame):
             self._block_message = "请先连接并授权手机" if chosen is not None else "没有检测到手机，请打开 USB 调试并连接"
             text = "连接手机后，把文件拖到这里"
         self.drop_label.configure(text=text)
+        self._update_capture_buttons()
+
+    def _update_capture_buttons(self) -> None:
+        ready = self._installable and not self._installing and not self._capturing
+        self.screenshot_button.configure(state="normal" if ready else "disabled")
+        if self._recording:
+            self.record_button.configure(text="停止", state="disabled" if self._record_stopping else "normal")
+            return
+        self.record_button.configure(text="录屏", state="normal" if ready else "disabled")
 
     def _enable_file_drop(self) -> None:
         TkinterDnD._require(self.winfo_toplevel())
@@ -312,14 +351,14 @@ class App(ctk.CTkFrame):
         return [widget for widget in surfaces if widget is not None]
 
     def _on_drop_enter(self, _event):
-        if self._installing:
+        if self._transfer_blocked():
             return REFUSE_DROP
         self._drag_inside += 1
         self._set_drop_highlight(True)
         return COPY
 
     def _on_drop_position(self, _event):
-        if self._installing:
+        if self._transfer_blocked():
             return REFUSE_DROP
         return COPY
 
@@ -331,7 +370,7 @@ class App(ctk.CTkFrame):
     def _on_drop(self, event):
         self._drag_inside = 0
         self._set_drop_highlight(False)
-        if self._installing:
+        if self._transfer_blocked():
             return REFUSE_DROP
         try:
             paths = self.tk.splitlist(event.data)
@@ -345,6 +384,7 @@ class App(ctk.CTkFrame):
             self._set_status(self._block_message, error=True, force=True)
             return COPY
         self._installing = True
+        self._update_capture_buttons()
         token = self._install_token
         serial = self._serial
         name = self._install_name
@@ -398,12 +438,13 @@ class App(ctk.CTkFrame):
 
     def _finish_install(self, token: int, message: str, error: bool) -> None:
         self._installing = False
-        if token != self._install_token:
-            return
         try:
             if not self.winfo_exists():
                 return
         except tkinter.TclError:
+            return
+        self._update_capture_buttons()
+        if token != self._install_token:
             return
         self._suppress_query_status = True
         self._set_status(message, error=error, force=True)
@@ -413,6 +454,131 @@ class App(ctk.CTkFrame):
             self.drop_zone.configure(border_width=2, border_color=("#1f6aa5", "#3b8ed0"))
             return
         self.drop_zone.configure(border_width=self._drop_border_width, border_color=self._drop_border_color)
+
+    def _transfer_blocked(self) -> bool:
+        return self._installing or self._recording
+
+    def _on_screenshot(self) -> None:
+        if not self._installable or not self._serial or self._installing or self._capturing:
+            self._set_status(self._block_message, error=True, force=True)
+            return
+        self._capturing = True
+        self._capture_token += 1
+        token = self._capture_token
+        serial = self._serial
+        self._update_capture_buttons()
+        self._set_status("正在截屏…", force=True)
+        threading.Thread(target=self._screenshot_worker, args=(token, serial), daemon=True).start()
+
+    def _screenshot_worker(self, token: int, serial: str) -> None:
+        try:
+            path = capture_screenshot(serial)
+            message = f"已保存到 {path}"
+            error = False
+        except DensityError as err:
+            message = str(err)
+            error = True
+        self._post_screenshot(token, message, error)
+
+    def _post_screenshot(self, token: int, message: str, error: bool) -> None:
+        try:
+            self.after(0, lambda token=token, message=message, error=error: self._finish_screenshot(token, message, error))
+        except (tkinter.TclError, RuntimeError):
+            self._capturing = False
+
+    def _finish_screenshot(self, token: int, message: str, error: bool) -> None:
+        if token != self._capture_token:
+            return
+        self._capturing = False
+        try:
+            if not self.winfo_exists():
+                return
+        except tkinter.TclError:
+            return
+        self._suppress_query_status = True
+        self._update_capture_buttons()
+        self._set_status(message, error=error, force=True)
+
+    def _on_record(self) -> None:
+        if self._recording:
+            if self._record_stopping:
+                return
+            self._record_stopping = True
+            self._record_stop.set()
+            self.record_button.configure(state="disabled")
+            self._set_status("正在停止录屏…", force=True)
+            return
+        if not self._installable or not self._serial or self._installing or self._capturing:
+            self._set_status(self._block_message, error=True, force=True)
+            return
+        self._recording = True
+        self._record_stopping = False
+        stop_event = threading.Event()
+        self._record_stop = stop_event
+        serial = self._serial
+        self.record_button.configure(text="停止", state="normal")
+        self._update_capture_buttons()
+        self._set_status("正在开始录屏…", force=True)
+        threading.Thread(target=self._record_worker, args=(serial, stop_event), daemon=True).start()
+
+    def _record_worker(self, serial: str, stop_event: threading.Event) -> None:
+        if stop_event.is_set():
+            self._post_record_finish("", False)
+            return
+        try:
+            recording = start_recording(serial)
+        except DensityError as err:
+            self._post_record_finish(str(err), True)
+            return
+        self._post_record_started(stop_event)
+        while recording.process.poll() is None and not stop_event.is_set():
+            stop_event.wait(0.2)
+        try:
+            path = stop_recording(recording)
+            message = f"已保存到 {path}"
+            error = False
+        except DensityError as err:
+            message = str(err)
+            error = True
+        self._post_record_finish(message, error)
+
+    def _post_record_started(self, stop_event: threading.Event) -> None:
+        try:
+            self.after(0, lambda stop_event=stop_event: self._show_recording(stop_event))
+        except (tkinter.TclError, RuntimeError):
+            stop_event.set()
+
+    def _show_recording(self, stop_event: threading.Event) -> None:
+        if stop_event.is_set() or not self._recording or self._record_stop is not stop_event:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except tkinter.TclError:
+            return
+        self._update_capture_buttons()
+        self._set_status(f"正在录屏，最长 3 分钟，点停止后保存到 {SAVE_DIR}", force=True)
+
+    def _post_record_finish(self, message: str, error: bool) -> None:
+        try:
+            self.after(0, lambda message=message, error=error: self._finish_record(message, error))
+        except (tkinter.TclError, RuntimeError):
+            self._recording = False
+            self._record_stopping = False
+
+    def _finish_record(self, message: str, error: bool) -> None:
+        self._recording = False
+        self._record_stopping = False
+        try:
+            if not self.winfo_exists():
+                return
+        except tkinter.TclError:
+            return
+        self._update_capture_buttons()
+        if not message:
+            return
+        self._suppress_query_status = True
+        self._set_status(message, error=error, force=True)
 
 
 def _busy_text(path: str, index: int, total: int) -> str:
@@ -450,8 +616,8 @@ def _device_choices(devices: tuple[Device, ...]) -> list[tuple[str, str]]:
 def main() -> None:
     root = ctk.CTk()
     root.title("ADB")
-    root.geometry("980x680")
-    root.minsize(860, 560)
+    root.geometry("980x720")
+    root.minsize(860, 600)
     root.grid_columnconfigure(0, weight=1)
     root.grid_rowconfigure(0, weight=1)
     App(root).grid(row=0, column=0, sticky="nsew")

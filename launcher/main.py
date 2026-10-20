@@ -57,7 +57,7 @@ TOOLS = (
     {
         "key": "density",
         "title": "ADB",
-        "description": "查看 xh/xxh，apk 安装，其他文件复制到 /sdcard",
+        "description": "查看 xh/xxh，安装 apk，截屏录屏到 D:\\adb",
     },
 )
 
