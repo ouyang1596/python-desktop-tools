@@ -65,6 +65,15 @@ class Recording:
     reader: threading.Thread
 
 
+@dataclass(frozen=True)
+class RemoteEntry:
+    """手机目录中的一项。path 是绝对路径。"""
+
+    name: str
+    path: str
+    is_dir: bool
+
+
 _BUCKETS = (
     (120, "ldpi", "ldpi"),
     (160, "mdpi", "mdpi"),
@@ -90,12 +99,14 @@ _INSTALL_TIMEOUT = "安装超时"
 _PUSH_TIMEOUT = "复制超时"
 _REMOTE_DIR = "/sdcard"
 _FAILURE = re.compile(r"Failure \[[^\]]+\]")
+_INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 SAVE_DIR = Path(r"D:\adb")
 _PNG_MAGIC = b"\x89PNG"
 _RECORD_LIMIT_SECONDS = "180"
 _SCREENSHOT_TIMEOUT = "截屏超时"
 _SAVE_TIMEOUT = "保存超时"
 _RECORD_TIMEOUT = "停止录屏超时"
+_LIST_TIMEOUT = "读取目录超时"
 
 
 def bucket_for(dpi: int) -> tuple[str, str]:
@@ -283,6 +294,32 @@ def push_failure_message(text: str) -> str:
     if not lines:
         return "复制失败"
     return f"复制失败：{lines[-1]}"
+
+
+def list_remote(serial: str, path: str, *, timeout: float = 15) -> tuple[RemoteEntry, ...]:
+    """列出手机目录。名称以 / 结尾的是文件夹。"""
+    remote = _clean_remote(path)
+    adb = find_adb()
+    stdout, stderr, code = _execute(
+        adb,
+        ["-s", serial, "shell", f"ls -1Ap {_shell_quote(remote)}"],
+        timeout,
+        _LIST_TIMEOUT,
+    )
+    if code != 0:
+        raise DensityError(_list_failure(stderr.strip() or stdout.strip()))
+    return tuple(_parse_remote_listing(remote, stdout))
+
+
+def pull_remote_file(serial: str, remote: str, *, timeout: float = 300) -> Path:
+    """把手机上的文件保存到 D:\\adb，保留原文件名。重名时追加 _2、_3。"""
+    name = _windows_filename(_remote_basename(remote))
+    if not name or name in {".", ".."}:
+        raise DensityError("无法保存该文件")
+    adb = find_adb()
+    local = _reserve_named(name)
+    _pull_file(adb, serial, remote, local, timeout, allow_empty=True)
+    return local
 
 
 def capture_screenshot(serial: str, *, timeout: float = 30) -> Path:
@@ -473,14 +510,14 @@ def _screenshot_via_pull(adb: str, serial: str, timeout: float, prior_error: str
         _remove_remote(adb, serial, remote)
 
 
-def _pull_file(adb: str, serial: str, remote: str, local: Path, timeout: float) -> None:
+def _pull_file(adb: str, serial: str, remote: str, local: Path, timeout: float, *, allow_empty: bool = False) -> None:
     stdout, stderr, code = _execute(
         adb,
         ["-s", serial, "pull", remote, str(local)],
         timeout,
         _SAVE_TIMEOUT,
     )
-    if code == 0 and local.is_file() and local.stat().st_size > 0:
+    if code == 0 and local.is_file() and (allow_empty or local.stat().st_size > 0):
         return
     local.unlink(missing_ok=True)
     raise DensityError(_pull_failure_message(f"{stdout}\n{stderr}"))
@@ -503,6 +540,85 @@ def _remove_remote(adb: str, serial: str, remote: str) -> None:
 def _remote_temp(suffix: str) -> str:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     return f"{_REMOTE_DIR}/python-desktop-tools-{stamp}{suffix}"
+
+
+def _clean_remote(path: str) -> str:
+    text = path.strip().replace("\\", "/")
+    if not text.startswith("/"):
+        text = f"/{text}"
+    while "//" in text:
+        text = text.replace("//", "/")
+    if len(text) > 1:
+        text = text.rstrip("/")
+    return text or "/"
+
+
+def _shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _parse_remote_listing(directory: str, text: str) -> list[RemoteEntry]:
+    entries: list[RemoteEntry] = []
+    for raw in _normalize(text).splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        is_dir = line.endswith("/")
+        name = line[:-1] if is_dir else line
+        if not name or name in {".", ".."}:
+            continue
+        entries.append(RemoteEntry(name=name, path=_join_remote(directory, name), is_dir=is_dir))
+    entries.sort(key=lambda item: (not item.is_dir, item.name.casefold()))
+    return entries
+
+
+def _join_remote(directory: str, name: str) -> str:
+    if directory == "/":
+        return f"/{name}"
+    return f"{directory}/{name}"
+
+
+def _remote_basename(path: str) -> str:
+    return path.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _windows_filename(name: str) -> str:
+    return _INVALID_FILENAME.sub("_", name).rstrip(" .")
+
+
+def _reserve_named(filename: str) -> Path:
+    """占一个不重名的本地文件。已有同名文件时追加 _2、_3。"""
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    stem, suffix = _split_filename(filename)
+    names = [f"{stem}{suffix}"]
+    names.extend(f"{stem}_{index}{suffix}" for index in range(2, 100))
+    for name in names:
+        path = SAVE_DIR / name
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return path
+    raise DensityError("无法保存文件")
+
+
+def _split_filename(filename: str) -> tuple[str, str]:
+    if filename.startswith(".") and filename.count(".") == 1:
+        return filename, ""
+    dot = filename.rfind(".")
+    if dot <= 0:
+        return filename, ""
+    return filename[:dot], filename[dot:]
+
+
+def _list_failure(text: str) -> str:
+    cleaned = _clean_adb_error(text.strip())
+    if cleaned in {_UNAUTHORIZED, _OFFLINE, _NO_DEVICE, "没有 USB 调试权限"}:
+        return cleaned
+    if not text.strip() or cleaned == "adb 执行失败":
+        return "读取目录失败"
+    return f"读取目录失败：{cleaned.splitlines()[-1]}"
 
 
 def _reserve_path(kind: str, suffix: str) -> Path:

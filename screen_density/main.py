@@ -18,11 +18,14 @@ from screen_density.density import (
     DensityError,
     Device,
     ProbeResult,
+    RemoteEntry,
     ScreenDensity,
     capture_screenshot,
     device_label,
     install_apk,
+    list_remote,
     probe,
+    pull_remote_file,
     push_file,
     start_recording,
     stop_recording,
@@ -70,6 +73,13 @@ class App(ctk.CTkFrame):
         self._installable = False
         self._install_name = ""
         self._block_message = "请先连接并授权手机"
+        self._remote_path = "/sdcard"
+        self._listing = False
+        self._list_token = 0
+        self._saving = False
+        self._save_token = 0
+        self._browser: ctk.CTkToplevel | None = None
+        self._browser_needs_reload = False
         self._drag_inside = 0
         self._suppress_query_status = False
         self._values = {key: "" for key, _title, _copy in _FIELDS}
@@ -84,8 +94,14 @@ class App(ctk.CTkFrame):
         self._token += 1
         self._install_token += 1
         self._capture_token += 1
+        self._list_token += 1
+        self._save_token += 1
         self._capturing = False
+        self._listing = False
+        self._saving = False
+        self._browser_needs_reload = False
         self._record_stop.set()
+        self._close_browser()
         self._cancel_arm()
 
     def grid(self, *args, **kwargs):
@@ -156,6 +172,10 @@ class App(ctk.CTkFrame):
         self.screenshot_button.pack(side="left")
         self.record_button = ctk.CTkButton(actions, text="录屏", width=88, command=self._on_record, state="disabled")
         self.record_button.pack(side="left", padx=(8, 0))
+        self.browse_button = ctk.CTkButton(
+            actions, text="文件浏览", width=96, command=self._on_browse, state="disabled"
+        )
+        self.browse_button.pack(side="left", padx=(8, 0))
 
         self.drop_zone = ctk.CTkFrame(device, height=88, corner_radius=10, border_width=1, border_color=("gray70", "gray40"))
         self.drop_zone.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 14))
@@ -233,10 +253,17 @@ class App(ctk.CTkFrame):
             self._serial = None
         self._show_devices(result.devices)
         if result.screen is None:
+            self._browser_needs_reload = False
+            self._show_browser_disconnected(result.message, result.error)
             self._set_status(result.message, error=result.error)
             return
         self._show_screen(result.screen)
         self._set_status(result.message, error=result.error)
+        if self._browser_needs_reload and self._browser_open():
+            self._browser_needs_reload = False
+            self._load_files()
+            return
+        self._browser_needs_reload = False
 
     def _on_device(self, label: str) -> None:
         if self._syncing:
@@ -245,6 +272,8 @@ class App(ctk.CTkFrame):
         if not serial or serial == self._serial:
             return
         self._serial = serial
+        self._remote_path = "/sdcard"
+        self._browser_needs_reload = self._browser_open()
         self.refresh()
 
     def _show_devices(self, devices: tuple[Device, ...]) -> None:
@@ -326,8 +355,11 @@ class App(ctk.CTkFrame):
         self.screenshot_button.configure(state="normal" if ready else "disabled")
         if self._recording:
             self.record_button.configure(text="停止", state="disabled" if self._record_stopping else "normal")
-            return
-        self.record_button.configure(text="录屏", state="normal" if ready else "disabled")
+        else:
+            self.record_button.configure(text="录屏", state="normal" if ready else "disabled")
+        can_browse = ready and not self._recording
+        self.browse_button.configure(state="normal" if can_browse else "disabled")
+        self._set_file_controls()
 
     def _enable_file_drop(self) -> None:
         TkinterDnD._require(self.winfo_toplevel())
@@ -579,6 +611,271 @@ class App(ctk.CTkFrame):
             return
         self._suppress_query_status = True
         self._set_status(message, error=error, force=True)
+
+    def _on_browse(self) -> None:
+        if self._browser_open():
+            self._raise_browser()
+            return
+        if not self._installable or not self._serial or self._installing or self._capturing or self._recording:
+            self._set_status(self._block_message, error=True, force=True)
+            return
+        self._remote_path = "/sdcard"
+        self._open_browser()
+        self._load_files()
+
+    def _browser_open(self) -> bool:
+        browser = self._browser
+        if browser is None:
+            return False
+        try:
+            return bool(browser.winfo_exists())
+        except tkinter.TclError:
+            return False
+
+    def _open_browser(self) -> None:
+        dialog = ctk.CTkToplevel(self)
+        dialog.withdraw()
+        dialog.title("文件浏览")
+        dialog.geometry("720x560")
+        dialog.minsize(560, 420)
+        dialog.transient(self.winfo_toplevel())
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(1, weight=1)
+
+        path_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        path_row.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        path_row.grid_columnconfigure(0, weight=1)
+        self.file_path = ctk.CTkLabel(path_row, text=self._remote_path, font=FONT_CODE, anchor="w")
+        self.file_path.grid(row=0, column=0, sticky="ew")
+        self.file_up = ctk.CTkButton(path_row, text="上级", width=72, command=self._on_file_up, state="disabled")
+        self.file_up.grid(row=0, column=1, padx=(8, 0))
+
+        self.file_list = ctk.CTkScrollableFrame(dialog, height=360, fg_color="transparent")
+        self.file_list.grid(row=1, column=0, sticky="nsew", padx=16, pady=4)
+        self.file_list.grid_columnconfigure(0, weight=1)
+
+        self.file_status = ctk.CTkLabel(dialog, text="", font=FONT_SM, anchor="w")
+        self.file_status.grid(row=2, column=0, sticky="ew", padx=16, pady=(8, 16))
+        dialog.protocol("WM_DELETE_WINDOW", self._close_browser)
+        self._browser = dialog
+        dialog.after(0, self._raise_browser)
+
+    def _raise_browser(self) -> None:
+        browser = self._browser
+        if not self._browser_open() or browser is None:
+            return
+        browser.deiconify()
+        browser.attributes("-topmost", True)
+        browser.lift()
+        browser.focus()
+        browser.after(100, lambda: self._clear_browser_topmost(browser))
+
+    def _clear_browser_topmost(self, browser: ctk.CTkToplevel) -> None:
+        if self._browser is not browser or not self._browser_open():
+            return
+        try:
+            browser.attributes("-topmost", False)
+        except tkinter.TclError:
+            return
+
+    def _close_browser(self) -> None:
+        self._list_token += 1
+        self._save_token += 1
+        self._listing = False
+        self._saving = False
+        browser = self._browser
+        self._browser = None
+        if browser is None:
+            return
+        try:
+            if browser.winfo_exists():
+                browser.destroy()
+        except tkinter.TclError:
+            return
+
+    def _load_files(self) -> None:
+        if not self._browser_open():
+            return
+        if not self._installable or not self._serial:
+            self._show_browser_disconnected(self._block_message, True)
+            return
+        self._list_token += 1
+        token = self._list_token
+        serial = self._serial
+        path = self._remote_path
+        self._listing = True
+        self.file_path.configure(text=path)
+        self._show_file_message("正在读取目录…")
+        self._set_browser_status("正在读取目录…")
+        self._set_file_controls()
+        threading.Thread(target=self._list_worker, args=(token, serial, path), daemon=True).start()
+
+    def _list_worker(self, token: int, serial: str, path: str) -> None:
+        try:
+            entries = list_remote(serial, path)
+            error = ""
+        except DensityError as err:
+            entries = ()
+            error = str(err)
+        try:
+            self.after(
+                0,
+                lambda token=token, path=path, entries=entries, error=error: self._apply_files(token, path, entries, error),
+            )
+        except (tkinter.TclError, RuntimeError):
+            return
+
+    def _apply_files(self, token: int, path: str, entries: tuple[RemoteEntry, ...], error: str) -> None:
+        if token != self._list_token or not self._browser_open():
+            return
+        self._listing = False
+        try:
+            if not self.winfo_exists():
+                return
+        except tkinter.TclError:
+            return
+        if path != self._remote_path:
+            self._set_file_controls()
+            return
+        self.file_path.configure(text=path)
+        if error:
+            self._show_file_message(error)
+            self._set_browser_status(error, error=True)
+        elif not entries:
+            self._show_file_message("这个目录是空的")
+            self._set_browser_status("")
+        else:
+            self._render_entries(entries)
+            self._set_browser_status("")
+        self._set_file_controls()
+
+    def _show_browser_disconnected(self, message: str, error: bool) -> None:
+        if not self._browser_open():
+            return
+        self._list_token += 1
+        self._listing = False
+        self.file_path.configure(text=self._remote_path)
+        self._show_file_message("连接手机后显示文件")
+        self._set_browser_status(message, error=error)
+        self._set_file_controls()
+
+    def _show_file_message(self, text: str) -> None:
+        if not self._browser_open():
+            return
+        self._clear_file_rows()
+        ctk.CTkLabel(
+            self.file_list,
+            text=text,
+            font=FONT,
+            anchor="w",
+            justify="left",
+            wraplength=640,
+            text_color=EMPTY_COLOR,
+        ).grid(row=0, column=0, sticky="ew", pady=4)
+
+    def _render_entries(self, entries: tuple[RemoteEntry, ...]) -> None:
+        self._clear_file_rows()
+        for index, entry in enumerate(entries):
+            text = f"目录  {entry.name}" if entry.is_dir else entry.name
+            ctk.CTkButton(
+                self.file_list,
+                text=text,
+                anchor="w",
+                height=32,
+                font=FONT,
+                fg_color="transparent",
+                text_color=VALUE_COLOR,
+                hover_color=("gray80", "gray25"),
+                command=lambda item=entry: self._on_file_entry(item),
+            ).grid(row=index, column=0, sticky="ew", pady=1)
+
+    def _clear_file_rows(self) -> None:
+        if not self._browser_open():
+            return
+        for child in self.file_list.winfo_children():
+            child.destroy()
+
+    def _on_file_up(self) -> None:
+        if not self._can_browse():
+            return
+        parent = _remote_parent(self._remote_path)
+        if parent is None:
+            return
+        self._remote_path = parent
+        self._load_files()
+
+    def _on_file_entry(self, entry: RemoteEntry) -> None:
+        if not self._can_browse() or not self._serial:
+            return
+        if entry.is_dir:
+            self._remote_path = entry.path
+            self._load_files()
+            return
+        self._saving = True
+        self._save_token += 1
+        token = self._save_token
+        serial = self._serial
+        remote = entry.path
+        self._set_file_controls()
+        self._set_browser_status("正在保存…")
+        threading.Thread(target=self._save_worker, args=(token, serial, remote), daemon=True).start()
+
+    def _save_worker(self, token: int, serial: str, remote: str) -> None:
+        try:
+            path = pull_remote_file(serial, remote)
+            message = f"已保存到 {path}"
+            error = False
+        except DensityError as err:
+            message = str(err)
+            error = True
+        try:
+            self.after(0, lambda token=token, message=message, error=error: self._finish_save(token, message, error))
+        except (tkinter.TclError, RuntimeError):
+            self._saving = False
+
+    def _finish_save(self, token: int, message: str, error: bool) -> None:
+        if token != self._save_token:
+            return
+        self._saving = False
+        try:
+            if not self.winfo_exists() or not self._browser_open():
+                return
+        except tkinter.TclError:
+            return
+        self._set_file_controls()
+        self._set_browser_status(message, error=error)
+
+    def _set_browser_status(self, message: str, *, error: bool = False) -> None:
+        if not self._browser_open():
+            return
+        self.file_status.configure(text=message, text_color=STATUS_ERROR if error else STATUS_OK)
+
+    def _set_file_controls(self) -> None:
+        if not self._browser_open():
+            return
+        can_up = self._can_browse() and _remote_parent(self._remote_path) is not None
+        self.file_up.configure(state="normal" if can_up else "disabled")
+        state = "normal" if self._can_browse() else "disabled"
+        for child in self.file_list.winfo_children():
+            if isinstance(child, ctk.CTkButton):
+                child.configure(state=state)
+
+    def _can_browse(self) -> bool:
+        return bool(
+            self._installable
+            and self._serial
+            and not self._installing
+            and not self._recording
+            and not self._saving
+            and not self._listing
+        )
+
+
+def _remote_parent(path: str) -> str | None:
+    if path == "/":
+        return None
+    parent = path.rstrip("/").rsplit("/", 1)[0]
+    return parent or "/"
 
 
 def _busy_text(path: str, index: int, total: int) -> str:
