@@ -57,7 +57,7 @@ TOOLS = (
     {
         "key": "density",
         "title": "屏幕密度",
-        "description": "查看已连接手机是 xh 还是 xxh",
+        "description": "查看 xh/xxh，拖入 apk 安装到该手机",
     },
 )
 

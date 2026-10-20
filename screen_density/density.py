@@ -72,6 +72,8 @@ _NO_ADB = "未找到 adb，请安装 Android SDK platform-tools 并加入 PATH"
 _UNAUTHORIZED = "手机未授权，请在手机上允许 USB 调试"
 _OFFLINE = "设备离线"
 _TIMEOUT = "查询超时，请确认手机已解锁并允许 USB 调试"
+_INSTALL_TIMEOUT = "安装超时"
+_FAILURE = re.compile(r"Failure \[[^\]]+\]")
 
 
 def bucket_for(dpi: int) -> tuple[str, str]:
@@ -201,6 +203,38 @@ def probe(serial: str | None = None, *, timeout: float = 10) -> ProbeResult:
     return ProbeResult(devices, screen, message, False)
 
 
+def install_apk(serial: str, path: str, *, timeout: float = 300) -> None:
+    """把 apk 覆盖安装到指定手机。已安装时用 -r 替换。"""
+    apk = Path(path)
+    if not apk.is_file() or apk.suffix.lower() != ".apk":
+        raise DensityError("请拖入 apk 文件")
+    adb = find_adb()
+    stdout, stderr, code = _execute(
+        adb,
+        ["-s", serial, "install", "-r", str(apk)],
+        timeout,
+        _INSTALL_TIMEOUT,
+    )
+    text = _normalize(f"{stdout}\n{stderr}")
+    if code == 0 and re.search(r"\bSuccess\b", text):
+        return
+    raise DensityError(install_failure_message(text))
+
+
+def install_failure_message(text: str) -> str:
+    match = _FAILURE.search(text)
+    if match:
+        return f"安装失败：{match.group(0)}"
+    lines = [
+        line.strip()
+        for line in _normalize(text).splitlines()
+        if line.strip() and "Performing Streamed Install" not in line
+    ]
+    if not lines:
+        return "安装失败"
+    return f"安装失败：{lines[-1]}"
+
+
 def device_label(device: Device) -> str:
     if device.model:
         name = f"{device.model.replace('_', ' ')} {device.serial}"
@@ -225,6 +259,13 @@ def _read_screen(adb: str, serial: str, timeout: float) -> ScreenDensity:
 
 
 def _run(adb: str, args: list[str], timeout: float) -> str:
+    stdout, stderr, code = _execute(adb, args, timeout, _TIMEOUT)
+    if code != 0 and not stdout.strip():
+        raise DensityError(_clean_adb_error(stderr.strip()))
+    return stdout
+
+
+def _execute(adb: str, args: list[str], timeout: float, timeout_message: str) -> tuple[str, str, int]:
     kwargs: dict = {}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -237,14 +278,12 @@ def _run(adb: str, args: list[str], timeout: float) -> str:
             **kwargs,
         )
     except subprocess.TimeoutExpired:
-        raise DensityError(_TIMEOUT) from None
+        raise DensityError(timeout_message) from None
     except OSError:
         raise DensityError("无法启动 adb") from None
     stdout = _normalize(completed.stdout.decode("utf-8", errors="replace"))
-    if completed.returncode != 0 and not stdout.strip():
-        stderr = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise DensityError(_clean_adb_error(stderr))
-    return stdout
+    stderr = _normalize(completed.stderr.decode("utf-8", errors="replace"))
+    return stdout, stderr, completed.returncode
 
 
 def _adb_candidates() -> list[Path]:

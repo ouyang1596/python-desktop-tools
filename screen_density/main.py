@@ -11,8 +11,9 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import customtkinter as ctk
+from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP, TkinterDnD
 
-from screen_density.density import Device, ProbeResult, ScreenDensity, device_label, probe
+from screen_density.density import DensityError, Device, ProbeResult, ScreenDensity, device_label, install_apk, probe
 
 FONT = ("Microsoft YaHei UI", 13)
 FONT_SM = ("Microsoft YaHei UI", 12)
@@ -46,6 +47,13 @@ class App(ctk.CTkFrame):
         self._syncing = False
         self._arm_job = None
         self._by_label: dict[str, str] = {}
+        self._installing = False
+        self._install_token = 0
+        self._installable = False
+        self._install_name = ""
+        self._block_message = "连接手机后，把 apk 拖到这里"
+        self._drag_inside = 0
+        self._suppress_query_status = False
         self._values = {"short": "", **{key: "" for key, _title, _copy in _FIELDS}}
         self._labels: dict[str, ctk.CTkLabel] = {}
         self.grid_columnconfigure(0, weight=1)
@@ -56,6 +64,7 @@ class App(ctk.CTkFrame):
     def pause(self) -> None:
         """离开页面时丢弃尚未返回的查询结果。"""
         self._token += 1
+        self._install_token += 1
         self._cancel_arm()
 
     def grid(self, *args, **kwargs):
@@ -102,7 +111,7 @@ class App(ctk.CTkFrame):
 
         device = self._card(body, 0, "手机")
         device_row = ctk.CTkFrame(device, fg_color="transparent")
-        device_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(4, 14))
+        device_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(4, 8))
         device_row.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(device_row, text="设备", font=FONT, anchor="w", width=88).grid(row=0, column=0, sticky="w")
         self.device_name = ctk.CTkLabel(device_row, text="未连接", font=FONT_CODE, anchor="w", text_color=EMPTY_COLOR)
@@ -117,6 +126,23 @@ class App(ctk.CTkFrame):
         )
         self.device_menu.grid(row=0, column=1, sticky="ew")
         self.device_menu.grid_remove()
+
+        self.drop_zone = ctk.CTkFrame(device, height=72, corner_radius=10, border_width=1, border_color=("gray70", "gray40"))
+        self.drop_zone.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self.drop_zone.grid_propagate(False)
+        self.drop_zone.grid_columnconfigure(0, weight=1)
+        self.drop_zone.grid_rowconfigure(0, weight=1)
+        self.drop_label = ctk.CTkLabel(
+            self.drop_zone,
+            text="连接手机后，把 apk 拖到这里",
+            font=FONT,
+            text_color=("gray30", "gray70"),
+            wraplength=720,
+        )
+        self.drop_label.grid(row=0, column=0, sticky="nsew", padx=12)
+        self._drop_border_width = self.drop_zone.cget("border_width")
+        self._drop_border_color = self.drop_zone.cget("border_color")
+        self._enable_file_drop()
 
         result = self._card(body, 1, "结果")
         summary = ctk.CTkFrame(result, fg_color="transparent")
@@ -159,7 +185,9 @@ class App(ctk.CTkFrame):
         serial = self._serial
         self.refresh_button.configure(state="disabled")
         self._clear_results()
-        self._set_status("正在查询…")
+        if not self._installing:
+            self._suppress_query_status = False
+            self._set_status("正在查询…")
         threading.Thread(target=self._query, args=(token, serial), daemon=True).start()
 
     def _query(self, token: int, serial: str | None) -> None:
@@ -204,6 +232,7 @@ class App(ctk.CTkFrame):
         serials = {serial for _label, serial in pairs}
         if pairs and self._serial not in serials:
             self._serial = pairs[0][1]
+        self._update_drop_hint(devices)
         if len(pairs) <= 1:
             self.device_menu.grid_remove()
             text = pairs[0][0] if pairs else "未连接"
@@ -240,11 +269,11 @@ class App(ctk.CTkFrame):
     def _copy(self, key: str) -> None:
         text = self._values.get(key, "")
         if not text:
-            self._set_status("没有可复制的内容", error=True)
+            self._set_status("没有可复制的内容", error=True, force=True)
             return
         self.clipboard_clear()
         self.clipboard_append(text)
-        self._set_status("已复制")
+        self._set_status("已复制", force=True)
 
     def _set_value(self, key: str, text: str, *, prominent: bool = False) -> None:
         self._values[key] = text
@@ -254,8 +283,140 @@ class App(ctk.CTkFrame):
             return
         label.configure(text="—", text_color=EMPTY_COLOR)
 
-    def _set_status(self, message: str, *, error: bool = False) -> None:
+    def _set_status(self, message: str, *, error: bool = False, force: bool = False) -> None:
+        if not force and (self._installing or self._suppress_query_status):
+            return
         self.status_label.configure(text=message, text_color=STATUS_ERROR if error else STATUS_OK)
+
+    def _update_drop_hint(self, devices: tuple[Device, ...]) -> None:
+        chosen = next((device for device in devices if device.serial == self._serial), None)
+        self._installable = chosen is not None and chosen.state == "device"
+        if self._installable and chosen is not None:
+            self._install_name = device_label(chosen)
+            text = f"把 apk 拖到这里，安装到 {self._install_name}"
+        else:
+            self._install_name = ""
+            self._block_message = "请先连接并授权手机" if chosen is not None else "没有检测到手机，请打开 USB 调试并连接"
+            text = "连接手机后，把 apk 拖到这里"
+        self.drop_label.configure(text=text)
+
+    def _enable_file_drop(self) -> None:
+        TkinterDnD._require(self.winfo_toplevel())
+        for widget in self._drop_surfaces():
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<DropEnter>>", self._on_drop_enter)
+            widget.dnd_bind("<<DropPosition>>", self._on_drop_position)
+            widget.dnd_bind("<<DropLeave>>", self._on_drop_leave)
+            widget.dnd_bind("<<Drop>>", self._on_drop)
+
+    def _drop_surfaces(self):
+        zone = self.drop_zone
+        label = self.drop_label
+        surfaces = [
+            zone,
+            getattr(zone, "_canvas", None),
+            label,
+            getattr(label, "_canvas", None),
+            getattr(label, "_label", None),
+        ]
+        return [widget for widget in surfaces if widget is not None]
+
+    def _on_drop_enter(self, _event):
+        if self._installing:
+            return REFUSE_DROP
+        self._drag_inside += 1
+        self._set_drop_highlight(True)
+        return COPY
+
+    def _on_drop_position(self, _event):
+        if self._installing:
+            return REFUSE_DROP
+        return COPY
+
+    def _on_drop_leave(self, _event) -> None:
+        self._drag_inside = max(0, self._drag_inside - 1)
+        if self._drag_inside == 0:
+            self._set_drop_highlight(False)
+
+    def _on_drop(self, event):
+        self._drag_inside = 0
+        self._set_drop_highlight(False)
+        if self._installing:
+            return REFUSE_DROP
+        try:
+            paths = self.tk.splitlist(event.data)
+        except tkinter.TclError:
+            paths = (event.data,) if event.data else ()
+        apks = [path for path in paths if Path(path).suffix.lower() == ".apk" and Path(path).is_file()]
+        if not apks:
+            self._set_status("请拖入 apk 文件", error=True, force=True)
+            return COPY
+        if not self._installable or not self._serial:
+            self._set_status(self._block_message, error=True, force=True)
+            return COPY
+        self._installing = True
+        token = self._install_token
+        serial = self._serial
+        name = self._install_name
+        self._set_status("正在安装…", force=True)
+        threading.Thread(target=self._install_files, args=(token, serial, name, tuple(apks)), daemon=True).start()
+        return COPY
+
+    def _install_files(self, token: int, serial: str, name: str, apks: tuple[str, ...]) -> None:
+        message = f"已安装到 {name}"
+        error = False
+        try:
+            total = len(apks)
+            for index, path in enumerate(apks, start=1):
+                if total > 1:
+                    self._post_status(token, f"正在安装 {index}/{total}…")
+                install_apk(serial, path)
+            if total > 1:
+                message = f"已安装 {total} 个到 {name}"
+        except DensityError as err:
+            message = str(err)
+            error = True
+        self._post_finish(token, message, error)
+
+    def _post_status(self, token: int, message: str) -> None:
+        try:
+            self.after(0, lambda token=token, message=message: self._show_install_status(token, message))
+        except (tkinter.TclError, RuntimeError):
+            return
+
+    def _post_finish(self, token: int, message: str, error: bool) -> None:
+        try:
+            self.after(0, lambda token=token, message=message, error=error: self._finish_install(token, message, error))
+        except (tkinter.TclError, RuntimeError):
+            self._installing = False
+
+    def _show_install_status(self, token: int, message: str) -> None:
+        if token != self._install_token or not self._installing:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except tkinter.TclError:
+            return
+        self._set_status(message, force=True)
+
+    def _finish_install(self, token: int, message: str, error: bool) -> None:
+        self._installing = False
+        if token != self._install_token:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except tkinter.TclError:
+            return
+        self._suppress_query_status = True
+        self._set_status(message, error=error, force=True)
+
+    def _set_drop_highlight(self, active: bool) -> None:
+        if active:
+            self.drop_zone.configure(border_width=2, border_color=("#1f6aa5", "#3b8ed0"))
+            return
+        self.drop_zone.configure(border_width=self._drop_border_width, border_color=self._drop_border_color)
 
 
 def _device_choices(devices: tuple[Device, ...]) -> list[tuple[str, str]]:
