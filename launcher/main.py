@@ -11,6 +11,7 @@ if __package__ in (None, ""):
 import customtkinter as ctk
 
 from anim_preview.main import App as AnimPreviewApp
+from color_converter.main import App as ColorConverterApp
 from image_compressor.main import App as ImageCompressorApp
 from json_formatter.main import App as JsonFormatterApp
 from svga_preview.main import App as SvgaPreviewApp
@@ -46,6 +47,11 @@ TOOLS = (
         "key": "timestamp",
         "title": "时间戳转换",
         "description": "秒、毫秒与日期时间互转",
+    },
+    {
+        "key": "color",
+        "title": "颜色转换",
+        "description": "十六进制、RGB 与透明度互转",
     },
 )
 
@@ -119,6 +125,7 @@ class Shell(ctk.CTk):
             "svga": SvgaPreviewApp(self, on_back=self.show_home),
             "anim": AnimPreviewApp(self, on_back=self.show_home),
             "timestamp": TimestampConverterApp(self, on_back=self.show_home),
+            "color": ColorConverterApp(self, on_back=self.show_home),
         }
         self.show_home()
 

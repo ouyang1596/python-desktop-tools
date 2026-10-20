@@ -9,7 +9,7 @@ pip install -r requirements.txt
 python -m launcher
 ```
 
-主界面用网格列出图片压缩、JSON 格式化、SVGA 预览、动图播放和时间戳转换，点击卡片进入对应工具，点「返回」回到主界面。
+主界面用网格列出图片压缩、JSON 格式化、SVGA 预览、动图播放、时间戳转换和颜色转换，点击卡片进入对应工具，点「返回」回到主界面。
 
 ## 图片压缩
 
@@ -78,3 +78,17 @@ python -m timestamp_converter
 ```
 
 窗口顶部显示当前本地时间，以及对应的秒、毫秒时间戳，每秒刷新。时间戳转日期时可选择自动识别单位，或指定秒、毫秒；整数部分不超过 10 位按秒处理，更长按毫秒处理。日期转时间戳支持 `YYYY-MM-DD HH:MM:SS`、带毫秒、仅日期、`YYYY/MM/DD HH:MM:SS` 和 ISO 8601。时区可选本机或 UTC；字符串里如果写了 `Z` 或 `±HH:MM`，以字符串中的时区为准。结果可以分别复制。从主界面进入时，点「返回」会停止刷新当前时间。
+
+## 颜色转换
+
+在 Android 色值之间互转，并预览带透明度的颜色。
+
+### 启动
+
+```bash
+python -m color_converter
+```
+
+输入支持 `#RGB`、`#ARGB`、`#RRGGBB`、`#AARRGGBB`（可以不写 `#`）、`0x` 加 6 位或 8 位、`Color.parseColor("...")`、`rgb()` 和 `rgba()`。短写按 Android 规则展开：`#RGB` 透明度为 `FF`，`#ARGB` 每位数字重复一次。`rgba` 的透明度写 `50%` 按百分比，带小数点按 0 到 1，大于 1 的整数按 0 到 255。
+
+结果给出 `#AARRGGBB`、`#RRGGBB`、`Color.parseColor`、`0xAARRGGBB`、RGB 分量和透明度，可以分别复制。色块叠在棋盘格上，能看出透明度。拖动滑块或在输入框填写 0 到 100 的整数后回车，只改透明度。
