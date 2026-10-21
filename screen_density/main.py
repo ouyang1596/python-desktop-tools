@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import threading
 import tkinter
 from pathlib import Path
@@ -11,6 +13,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import customtkinter as ctk
+from PIL import Image, ImageOps, UnidentifiedImageError
 from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP, TkinterDnD
 
 from screen_density.density import (
@@ -26,6 +29,7 @@ from screen_density.density import (
     list_remote,
     probe,
     pull_remote_file,
+    pull_remote_into,
     push_file,
     start_recording,
     stop_recording,
@@ -39,6 +43,9 @@ STATUS_OK = ("gray20", "gray80")
 STATUS_ERROR = ("#c62828", "#ef9a9a")
 VALUE_COLOR = ("gray10", "gray90")
 EMPTY_COLOR = ("gray50", "gray60")
+_THUMB_SIZE = 48
+_THUMB_ROW = 56
+_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 _FIELDS = (
     ("qualifier", "目录名", False),
     ("dpi", "当前密度", True),
@@ -78,6 +85,10 @@ class App(ctk.CTkFrame):
         self._list_token = 0
         self._saving = False
         self._save_token = 0
+        self._thumb_token = 0
+        self._thumb_cache: dict[tuple[str, str], Image.Image] = {}
+        self._thumb_lock = threading.Lock()
+        self._thumb_buttons: dict[str, ctk.CTkButton] = {}
         self._browser: ctk.CTkToplevel | None = None
         self._browser_needs_reload = False
         self._drag_inside = 0
@@ -96,6 +107,7 @@ class App(ctk.CTkFrame):
         self._capture_token += 1
         self._list_token += 1
         self._save_token += 1
+        self._thumb_token += 1
         self._capturing = False
         self._listing = False
         self._saving = False
@@ -681,6 +693,7 @@ class App(ctk.CTkFrame):
     def _close_browser(self) -> None:
         self._list_token += 1
         self._save_token += 1
+        self._thumb_token += 1
         self._listing = False
         self._saving = False
         browser = self._browser
@@ -700,6 +713,7 @@ class App(ctk.CTkFrame):
             self._show_browser_disconnected(self._block_message, True)
             return
         self._list_token += 1
+        self._thumb_token += 1
         token = self._list_token
         serial = self._serial
         path = self._remote_path
@@ -753,6 +767,7 @@ class App(ctk.CTkFrame):
         if not self._browser_open():
             return
         self._list_token += 1
+        self._thumb_token += 1
         self._listing = False
         self.file_path.configure(text=self._remote_path)
         self._show_file_message("连接手机后显示文件")
@@ -775,21 +790,126 @@ class App(ctk.CTkFrame):
 
     def _render_entries(self, entries: tuple[RemoteEntry, ...]) -> None:
         self._clear_file_rows()
+        serial = self._serial or ""
+        pending: list[RemoteEntry] = []
         for index, entry in enumerate(entries):
+            image_row = not entry.is_dir and _is_image_name(entry.name)
             text = f"目录  {entry.name}" if entry.is_dir else entry.name
-            ctk.CTkButton(
+            button = ctk.CTkButton(
                 self.file_list,
                 text=text,
                 anchor="w",
-                height=32,
+                height=_THUMB_ROW if image_row else 32,
                 font=FONT,
                 fg_color="transparent",
                 text_color=VALUE_COLOR,
                 hover_color=("gray80", "gray25"),
+                compound="left",
                 command=lambda item=entry: self._on_file_entry(item),
-            ).grid(row=index, column=0, sticky="ew", pady=1)
+            )
+            button.grid(row=index, column=0, sticky="ew", pady=1)
+            if not image_row or not serial:
+                continue
+            self._thumb_buttons[entry.path] = button
+            cached = self._cached_thumb(serial, entry.path)
+            if cached is not None:
+                self._attach_thumb(button, cached)
+            else:
+                pending.append(entry)
+        if pending:
+            self._queue_thumbs(serial, tuple(pending))
+
+    def _queue_thumbs(self, serial: str, entries: tuple[RemoteEntry, ...]) -> None:
+        token = self._thumb_token
+        pending = list(entries)
+        lock = threading.Lock()
+
+        def take() -> RemoteEntry | None:
+            with lock:
+                if token != self._thumb_token or not pending:
+                    pending.clear()
+                    return None
+                return pending.pop(0)
+
+        def run() -> None:
+            while True:
+                entry = take()
+                if entry is None:
+                    return
+                try:
+                    image = self._fetch_thumb(serial, entry.path, token)
+                except Exception:
+                    continue
+                if image is None or token != self._thumb_token:
+                    continue
+                try:
+                    self.after(
+                        0,
+                        lambda token=token, path=entry.path, image=image: self._apply_thumb(token, path, image),
+                    )
+                except (tkinter.TclError, RuntimeError):
+                    return
+
+        workers = 2 if len(entries) > 1 else 1
+        for _ in range(workers):
+            threading.Thread(target=run, daemon=True).start()
+
+    def _fetch_thumb(self, serial: str, remote: str, token: int) -> Image.Image | None:
+        cached = self._cached_thumb(serial, remote)
+        if cached is not None:
+            return cached
+        if token != self._thumb_token:
+            return None
+        suffix = Path(remote).suffix.lower()
+        if suffix not in _IMAGE_SUFFIXES:
+            suffix = ".img"
+        fd, raw = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        dest = Path(raw)
+        image: Image.Image | None = None
+        try:
+            pull_remote_into(serial, remote, dest)
+            image = _decode_thumbnail(dest)
+        except (DensityError, OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError):
+            image = None
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            image = None
+        if image is None:
+            return None
+        self._store_thumb(serial, remote, image)
+        return image
+
+    def _cached_thumb(self, serial: str, remote: str) -> Image.Image | None:
+        with self._thumb_lock:
+            return self._thumb_cache.get((serial, remote))
+
+    def _store_thumb(self, serial: str, remote: str, image: Image.Image) -> None:
+        with self._thumb_lock:
+            self._thumb_cache[(serial, remote)] = image
+
+    def _apply_thumb(self, token: int, path: str, image: Image.Image) -> None:
+        if token != self._thumb_token or not self._browser_open():
+            return
+        button = self._thumb_buttons.get(path)
+        if button is None:
+            return
+        self._attach_thumb(button, image)
+
+    def _attach_thumb(self, button: ctk.CTkButton, image: Image.Image) -> None:
+        try:
+            if not button.winfo_exists():
+                return
+            shown = image.copy()
+            photo = ctk.CTkImage(light_image=shown, dark_image=shown, size=(shown.width, shown.height))
+            button._thumb_ref = photo
+            button.configure(image=photo)
+        except tkinter.TclError:
+            return
 
     def _clear_file_rows(self) -> None:
+        self._thumb_buttons = {}
         if not self._browser_open():
             return
         for child in self.file_list.winfo_children():
@@ -876,6 +996,22 @@ def _remote_parent(path: str) -> str | None:
         return None
     parent = path.rstrip("/").rsplit("/", 1)[0]
     return parent or "/"
+
+
+def _is_image_name(name: str) -> bool:
+    return Path(name).suffix.lower() in _IMAGE_SUFFIXES
+
+
+def _decode_thumbnail(path: Path) -> Image.Image:
+    """缩成小图。GIF 只用第一帧，并按 EXIF 方向转正。"""
+    with Image.open(path) as image:
+        image.seek(0)
+        oriented = ImageOps.exif_transpose(image) or image
+        frame = oriented.convert("RGBA")
+        frame.thumbnail((_THUMB_SIZE, _THUMB_SIZE), Image.Resampling.LANCZOS)
+        if frame.width <= 0 or frame.height <= 0:
+            raise ValueError("空图片")
+        return frame.copy()
 
 
 def _busy_text(path: str, index: int, total: int) -> str:

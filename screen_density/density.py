@@ -322,6 +322,16 @@ def pull_remote_file(serial: str, remote: str, *, timeout: float = 300) -> Path:
     return local
 
 
+def pull_remote_into(serial: str, remote: str, dest: Path, *, timeout: float = 120) -> None:
+    """把手机文件拉到 dest。不写入 D:\\adb，调用方用完后自行删除。"""
+    cleaned = _clean_remote(remote)
+    name = _remote_basename(cleaned)
+    if not name or name in {".", ".."}:
+        raise DensityError("无法读取该文件")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _pull_file(find_adb(), serial, cleaned, dest, timeout)
+
+
 def capture_screenshot(serial: str, *, timeout: float = 30) -> Path:
     """截取当前画面并保存为 PNG，返回本机路径。"""
     adb = find_adb()
