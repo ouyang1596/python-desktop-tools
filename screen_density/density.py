@@ -297,12 +297,12 @@ def push_failure_message(text: str) -> str:
 
 
 def list_remote(serial: str, path: str, *, timeout: float = 15) -> tuple[RemoteEntry, ...]:
-    """列出手机目录。名称以 / 结尾的是文件夹。"""
+    """列出手机目录。目录（含指向目录的符号链接）以 / 结尾。"""
     remote = _clean_remote(path)
     adb = find_adb()
     stdout, stderr, code = _execute(
         adb,
-        ["-s", serial, "shell", f"ls -1Ap {_shell_quote(remote)}"],
+        ["-s", serial, "shell", _list_shell(remote)],
         timeout,
         _LIST_TIMEOUT,
     )
@@ -555,6 +555,25 @@ def _clean_remote(path: str) -> str:
 
 def _shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _list_shell(remote: str) -> str:
+    """列目录，并把指向目录的符号链接也标成目录。
+
+    /sdcard 在 / 下是符号链接。ls -p 只看链接本身，不会加 /，
+    从 /sdcard 点上级回到 / 之后就点不回去。test -d 会跟着链接走。
+    """
+    quoted = _shell_quote(remote)
+    return (
+        f"cd {quoted} || exit 1; "
+        "list=$(ls -1A) || exit 1; "
+        "printf '%s\\n' \"$list\" | while IFS= read -r name; do "
+        "[ -n \"$name\" ] || continue; "
+        "if [ -d \"$name\" ]; then printf '%s/\\n' \"$name\"; "
+        "else printf '%s\\n' \"$name\"; fi; "
+        "done; "
+        "exit 0"
+    )
 
 
 def _parse_remote_listing(directory: str, text: str) -> list[RemoteEntry]:
