@@ -9,7 +9,7 @@ pip install -r requirements.txt
 python -m launcher
 ```
 
-主界面用网格列出图片压缩、JSON 格式化、SVGA 预览、动图播放、时间戳转换、颜色转换和 ADB，点击卡片进入对应工具，点「返回」回到主界面。
+主界面用网格列出图片压缩、JSON 格式化、SVGA 预览、动图播放、时间戳转换、颜色转换、ADB 和 APK 信息，点击卡片进入对应工具，点「返回」回到主界面。
 
 ## 图片压缩
 
@@ -106,3 +106,15 @@ python -m screen_density
 需要本机能运行 `adb`。程序会依次查找 PATH、`ANDROID_HOME`、`ANDROID_SDK_ROOT`，以及 `%LOCALAPPDATA%\Android\Sdk\platform-tools`。手机需打开 USB 调试并授权。
 
 进入页面或点「刷新」后查询。多台手机时从下拉框切换，名称后面带设备 ID。结果包含当前档位、目录名、当前密度、物理密度、倍数、分辨率、宽高 dp、型号、Android 版本和设备 ID。当前密度和设备 ID 可以复制。把文件拖进手机卡片里的框：apk 会覆盖安装到当前这台手机，其他文件复制到该手机的 `/sdcard` 并保留原文件名。一次拖入多个文件时按顺序处理，失败则停止。点「截屏」把当前画面保存为 PNG。点「录屏」开始录制，再点「停止」结束；最长 3 分钟，到时会自动结束。截屏和录屏都保存到 `D:\adb`，文件名带时间，同一秒重名时追加 `_2`。未连接、未授权或找不到 adb 时，底部状态栏会说明原因。从主界面进入时，点「返回」会丢弃尚未返回的查询结果，已经开始的安装或复制会继续，只是不再更新界面。正在进行的录屏会停止，并把视频保存到 `D:\adb`；界面已经关闭时不再更新状态。
+
+## APK 信息
+
+查看 apk 的应用名、包名、版本、minSdk、targetSdk、ABI 和权限。
+
+### 启动
+
+```bash
+python -m apk_info
+```
+
+点「打开 APK」或把 apk 拖进窗口。一次拖入多个文件时，只读取第一个 apk。需要本机的 aapt。程序会依次查找 PATH 里的 aapt2、aapt，以及 `ANDROID_HOME`、`ANDROID_SDK_ROOT`、`%LOCALAPPDATA%\Android\Sdk` 和 adb 所在 SDK 的 `build-tools`，用其中版本最高的一档。应用名优先用简体中文。没有原生库时 ABI 显示「无原生库」。`uses-permission-sdk-23` 会在权限名后注明 API 23+。各字段可以分别复制。找不到 aapt 或文件不是 apk 时，底部状态栏会说明原因。

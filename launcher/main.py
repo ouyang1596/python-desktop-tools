@@ -11,6 +11,7 @@ if __package__ in (None, ""):
 import customtkinter as ctk
 
 from anim_preview.main import App as AnimPreviewApp
+from apk_info.main import App as ApkInfoApp
 from color_converter.main import App as ColorConverterApp
 from image_compressor.main import App as ImageCompressorApp
 from json_formatter.main import App as JsonFormatterApp
@@ -58,6 +59,11 @@ TOOLS = (
         "key": "density",
         "title": "ADB",
         "description": "查看 xh/xxh，安装 apk，截屏录屏，浏览手机文件并保存到 D:\\adb",
+    },
+    {
+        "key": "apk",
+        "title": "APK 信息",
+        "description": "查看包名、版本、SDK、ABI 和权限",
     },
 )
 
@@ -133,6 +139,7 @@ class Shell(ctk.CTk):
             "timestamp": TimestampConverterApp(self, on_back=self.show_home),
             "color": ColorConverterApp(self, on_back=self.show_home),
             "density": ScreenDensityApp(self, on_back=self.show_home),
+            "apk": ApkInfoApp(self, on_back=self.show_home),
         }
         self.show_home()
 
