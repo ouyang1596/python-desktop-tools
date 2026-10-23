@@ -76,13 +76,13 @@ class HomeFrame(ctk.CTkFrame):
 
         content = ctk.CTkFrame(self, fg_color="transparent")
         content.grid(row=0, column=0)
-        ctk.CTkLabel(content, text=HOME_TITLE, font=FONT_TITLE).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ctk.CTkLabel(content, text=HOME_TITLE, font=FONT_TITLE).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
         ctk.CTkLabel(content, text="选择一个工具", font=FONT_SM, text_color=("gray30", "gray70")).grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(0, 20)
+            row=1, column=0, columnspan=3, sticky="w", pady=(0, 20)
         )
 
         for index, tool in enumerate(TOOLS):
-            row, column = divmod(index, 2)
+            row, column = divmod(index, 3)
             card = _ToolCard(content, tool["title"], tool["description"], command=lambda key=tool["key"]: on_open(key))
             card.grid(row=row + 2, column=column, padx=10, pady=10, sticky="nsew")
             content.grid_columnconfigure(column, weight=1, uniform="tools")
@@ -124,8 +124,8 @@ class Shell(ctk.CTk):
         ctk.set_appearance_mode("system")
         ctk.set_default_color_theme("blue")
         self.title(HOME_TITLE)
-        self.geometry("980x820")
-        self.minsize(860, 760)
+        self.geometry("1120x700")
+        self.minsize(1060, 640)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
