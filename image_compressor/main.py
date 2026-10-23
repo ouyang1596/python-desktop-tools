@@ -454,6 +454,11 @@ class App(ctk.CTkFrame):
             summary = f"{summary}\n{stopped}"
         summary = f"{summary}\n输出目录：{out_dir}"
         self.status_label.configure(text=summary.replace("\n", " "))
+        if ok > 0:
+            try:
+                os.startfile(out_dir)
+            except OSError:
+                pass
         messagebox.showinfo("压缩结束", summary)
 
     def _set_busy(self, busy: bool) -> None:
