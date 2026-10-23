@@ -13,6 +13,7 @@ from tkinter import filedialog, messagebox
 
 from json_formatter.folding_box import FoldingTextbox
 from json_formatter.formatter import FormatError, format_json, minify_json
+from json_formatter.highlight import apply_highlight, configure_highlight
 
 FONT = ("Microsoft YaHei UI", 13)
 FONT_SM = ("Microsoft YaHei UI", 12)
@@ -20,6 +21,7 @@ FONT_TITLE = ("Microsoft YaHei UI", 20)
 FONT_CODE = ("Consolas", 13)
 STATUS_OK = ("gray20", "gray80")
 STATUS_ERROR = ("#c62828", "#ef9a9a")
+HIGHLIGHT_DELAY_MS = 200
 
 
 def quoted_content_span(line: str, column: int) -> tuple[int, int] | None:
@@ -64,6 +66,7 @@ class App(ctk.CTkFrame):
         ctk.set_default_color_theme("blue")
         self._on_back = on_back
         self._result_text = ""
+        self._input_highlight_job: str | None = None
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
@@ -107,6 +110,11 @@ class App(ctk.CTkFrame):
         self.input_box.grid(row=1, column=0, sticky="nsew")
         self.output_box = FoldingTextbox(editors, font=FONT_CODE, wrap="none", undo=True)
         self.output_box.grid(row=1, column=1, sticky="nsew", padx=(12, 0))
+        configure_highlight(self.input_box._textbox, ctk.get_appearance_mode() or "Light")
+        ctk.AppearanceModeTracker.add(self._on_appearance, self)
+        self.input_box.bind("<KeyRelease>", self._schedule_input_highlight)
+        self.input_box.bind("<<Paste>>", self._schedule_input_highlight)
+        self.input_box.bind("<<Cut>>", self._schedule_input_highlight)
         self.input_box.bind("<Double-Button-1>", _select_quoted_on_double_click)
         self.output_box.bind("<Double-Button-1>", _select_quoted_on_double_click)
         self._lock_output()
@@ -131,6 +139,8 @@ class App(ctk.CTkFrame):
             self._set_status(f"无法读取文件：{err}", error=True)
             return
         self._set_text(self.input_box, text)
+        self._cancel_input_highlight()
+        self._highlight_input()
         self._set_output("")
         self._set_status(f"已打开 {path.name}")
 
@@ -189,6 +199,23 @@ class App(ctk.CTkFrame):
             self._set_status(f"无法保存文件：{err}", error=True)
             return
         self._set_status(f"已保存 {path.name}")
+
+    def _schedule_input_highlight(self, _event=None) -> None:
+        self._cancel_input_highlight()
+        self._input_highlight_job = self.after(HIGHLIGHT_DELAY_MS, self._highlight_input)
+
+    def _cancel_input_highlight(self) -> None:
+        if self._input_highlight_job is None:
+            return
+        self.after_cancel(self._input_highlight_job)
+        self._input_highlight_job = None
+
+    def _highlight_input(self) -> None:
+        self._input_highlight_job = None
+        apply_highlight(self.input_box._textbox, self._text(self.input_box))
+
+    def _on_appearance(self, mode: str) -> None:
+        configure_highlight(self.input_box._textbox, mode)
 
     def _indent(self) -> int:
         return 4 if str(self.indent_switch.get()).startswith("4") else 2

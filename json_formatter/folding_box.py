@@ -7,6 +7,7 @@ import tkinter
 import customtkinter as ctk
 
 from json_formatter.folding import Fold, find_folds
+from json_formatter.highlight import apply_highlight, configure_highlight
 
 _ELLIPSIS = "…"
 _HIDE_TAG = "fold_hidden"
@@ -153,6 +154,7 @@ class FoldingTextbox(ctk.CTkTextbox):
         color = self._bg_color if self._fg_color == "transparent" else self._fg_color
         self._gutter.configure(bg=self._apply_appearance_mode(color))
         self._arrow_color = self._apply_appearance_mode(self._text_color)
+        configure_highlight(self._textbox, self._get_appearance_mode())
         self._redraw_arrows()
 
     def _render(self) -> None:
@@ -164,6 +166,8 @@ class FoldingTextbox(ctk.CTkTextbox):
             self._textbox.delete("1.0", "end")
             if self._source:
                 self._textbox.insert("1.0", self._source)
+            configure_highlight(self._textbox, self._get_appearance_mode())
+            apply_highlight(self._textbox, self._source)
             for fold in sorted(self._active_collapsed(), key=lambda item: item.key, reverse=True):
                 self._textbox.insert(f"{fold.start_line}.{fold.start_col + 1}", _ELLIPSIS)
                 self._textbox.tag_add(

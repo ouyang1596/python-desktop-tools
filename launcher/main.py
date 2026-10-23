@@ -32,7 +32,7 @@ TOOLS = (
     {
         "key": "json",
         "title": "JSON 格式化",
-        "description": "缩进排版或压成一行",
+        "description": "缩进排版或压成一行，语法高亮",
     },
     {
         "key": "svga",
