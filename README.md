@@ -6,8 +6,10 @@
 
 ```bash
 pip install -r requirements.txt
-python -m launcher
+start.bat
 ```
+
+双击项目里的 `start.bat`，或在任意目录用完整路径运行它。脚本会先切回项目目录再启动，不必先进入项目目录。要放到桌面时，请创建指向这个文件的快捷方式，不要复制 `start.bat` 本身。
 
 主界面用网格列出图片压缩、JSON 格式化、SVGA 预览、动图播放、时间戳转换、颜色转换、ADB 和 APK 信息，点击卡片进入对应工具，点「返回」回到主界面。
 
