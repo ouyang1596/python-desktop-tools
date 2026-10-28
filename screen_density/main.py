@@ -718,25 +718,24 @@ class App(ctk.CTkFrame):
         stop_event: threading.Event,
     ) -> None:
         if stop_event.is_set():
-            self._post_log_finish("", False, None)
+            self._post_log_finish("", False)
             return
         try:
             capture = start_logcat(serial, keyword=keyword, level=level, app_only=app_only, clear=clear)
         except DensityError as err:
-            self._post_log_finish(str(err), True, None)
+            self._post_log_finish(str(err), True)
             return
         self._post_log_started(stop_event, capture.package)
         while capture.process.poll() is None and not stop_event.is_set():
             stop_event.wait(0.2)
         try:
             path = stop_logcat(capture)
-            message = f"已保存并打开 {path}"
+            message = f"已保存到 {path}"
             error = False
         except DensityError as err:
-            path = None
             message = str(err)
             error = True
-        self._post_log_finish(message, error, path)
+        self._post_log_finish(message, error)
 
     def _post_log_started(self, stop_event: threading.Event, package: str) -> None:
         try:
@@ -759,33 +758,22 @@ class App(ctk.CTkFrame):
             text = f"正在抓取日志，点停止后保存到 {SAVE_DIR}"
         self._set_status(text, force=True)
 
-    def _post_log_finish(self, message: str, error: bool, path: Path | None) -> None:
+    def _post_log_finish(self, message: str, error: bool) -> None:
         try:
-            self.after(0, lambda message=message, error=error, path=path: self._finish_log(message, error, path))
+            self.after(0, lambda message=message, error=error: self._finish_log(message, error))
         except (tkinter.TclError, RuntimeError):
             self._logging = False
             self._log_stopping = False
-            if path is not None and not error:
-                _open_text(path)
 
-    def _finish_log(self, message: str, error: bool, path: Path | None) -> None:
+    def _finish_log(self, message: str, error: bool) -> None:
         self._logging = False
         self._log_stopping = False
         try:
-            alive = self.winfo_exists()
+            if not self.winfo_exists():
+                return
         except tkinter.TclError:
-            alive = False
-        if not alive:
-            if path is not None and not error:
-                _open_text(path)
             return
         self._update_capture_buttons()
-        if path is not None and not error:
-            try:
-                os.startfile(path)
-            except OSError:
-                message = f"已保存到 {path}，无法打开"
-                error = True
         if not message:
             return
         self._suppress_query_status = True
@@ -1157,13 +1145,6 @@ class App(ctk.CTkFrame):
             and not self._saving
             and not self._listing
         )
-
-
-def _open_text(path: Path) -> None:
-    try:
-        os.startfile(path)
-    except OSError:
-        return
 
 
 def _remote_parent(path: str) -> str | None:
