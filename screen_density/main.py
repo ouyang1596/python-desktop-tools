@@ -31,7 +31,9 @@ from screen_density.density import (
     pull_remote_file,
     pull_remote_into,
     push_file,
+    start_logcat,
     start_recording,
+    stop_logcat,
     stop_recording,
 )
 
@@ -46,6 +48,15 @@ EMPTY_COLOR = ("gray50", "gray60")
 _THUMB_SIZE = 48
 _THUMB_ROW = 56
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+_LOG_LEVELS = (
+    ("全部", "V"),
+    ("调试", "D"),
+    ("信息", "I"),
+    ("警告", "W"),
+    ("错误", "E"),
+    ("致命", "F"),
+)
+_LOG_LEVEL_BY_LABEL = dict(_LOG_LEVELS)
 _FIELDS = (
     ("qualifier", "目录名", False),
     ("dpi", "当前密度", True),
@@ -77,6 +88,9 @@ class App(ctk.CTkFrame):
         self._recording = False
         self._record_stopping = False
         self._record_stop = threading.Event()
+        self._logging = False
+        self._log_stopping = False
+        self._log_stop = threading.Event()
         self._installable = False
         self._install_name = ""
         self._block_message = "请先连接并授权手机"
@@ -101,7 +115,7 @@ class App(ctk.CTkFrame):
         self.bind("<Destroy>", self._on_destroy)
 
     def pause(self) -> None:
-        """离开页面时丢弃尚未返回的查询结果，并停止录屏。"""
+        """离开页面时丢弃尚未返回的查询结果，并停止录屏和日志采集。"""
         self._token += 1
         self._install_token += 1
         self._capture_token += 1
@@ -113,6 +127,7 @@ class App(ctk.CTkFrame):
         self._saving = False
         self._browser_needs_reload = False
         self._record_stop.set()
+        self._log_stop.set()
         self._close_browser()
         self._cancel_arm()
 
@@ -189,8 +204,27 @@ class App(ctk.CTkFrame):
         )
         self.browse_button.pack(side="left", padx=(8, 0))
 
+        log_row = ctk.CTkFrame(device, fg_color="transparent")
+        log_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.log_keyword = ctk.CTkEntry(
+            log_row, placeholder_text="关键字，可留空", font=FONT, width=220, state="disabled"
+        )
+        self.log_keyword.pack(side="left")
+        self.log_level = ctk.CTkOptionMenu(
+            log_row,
+            values=[label for label, _code in _LOG_LEVELS],
+            font=FONT_SM,
+            dropdown_font=FONT_SM,
+            width=100,
+            state="disabled",
+        )
+        self.log_level.set("全部")
+        self.log_level.pack(side="left", padx=(8, 0))
+        self.log_button = ctk.CTkButton(log_row, text="抓日志", width=88, command=self._on_log, state="disabled")
+        self.log_button.pack(side="left", padx=(8, 0))
+
         self.drop_zone = ctk.CTkFrame(device, height=88, corner_radius=10, border_width=1, border_color=("gray70", "gray40"))
-        self.drop_zone.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self.drop_zone.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 14))
         self.drop_zone.grid_propagate(False)
         self.drop_zone.grid_columnconfigure(0, weight=1)
         self.drop_zone.grid_rowconfigure(0, weight=1)
@@ -238,7 +272,7 @@ class App(ctk.CTkFrame):
         serial = self._serial
         self.refresh_button.configure(state="disabled")
         self._clear_results()
-        if not self._installing and not self._recording:
+        if not self._installing and not self._recording and not self._logging:
             self._suppress_query_status = False
             self._set_status("正在查询…")
         threading.Thread(target=self._query, args=(token, serial), daemon=True).start()
@@ -345,7 +379,7 @@ class App(ctk.CTkFrame):
         label.configure(text="—", text_color=EMPTY_COLOR)
 
     def _set_status(self, message: str, *, error: bool = False, force: bool = False) -> None:
-        if not force and (self._installing or self._recording or self._capturing or self._suppress_query_status):
+        if not force and (self._installing or self._recording or self._logging or self._capturing or self._suppress_query_status):
             return
         self.status_label.configure(text=message, text_color=STATUS_ERROR if error else STATUS_OK)
 
@@ -364,13 +398,23 @@ class App(ctk.CTkFrame):
 
     def _update_capture_buttons(self) -> None:
         ready = self._installable and not self._installing and not self._capturing
-        self.screenshot_button.configure(state="normal" if ready else "disabled")
+        self.screenshot_button.configure(state="normal" if ready and not self._logging else "disabled")
         if self._recording:
             self.record_button.configure(text="停止", state="disabled" if self._record_stopping else "normal")
         else:
-            self.record_button.configure(text="录屏", state="normal" if ready else "disabled")
-        can_browse = ready and not self._recording
+            self.record_button.configure(text="录屏", state="normal" if ready and not self._logging else "disabled")
+        can_browse = ready and not self._recording and not self._logging
         self.browse_button.configure(state="normal" if can_browse else "disabled")
+        if self._logging:
+            self.log_button.configure(text="停止", state="disabled" if self._log_stopping else "normal")
+            self.log_keyword.configure(state="disabled")
+            self.log_level.configure(state="disabled")
+        else:
+            log_ready = ready and not self._recording
+            self.log_button.configure(text="抓日志", state="normal" if log_ready else "disabled")
+            filter_state = "normal" if log_ready else "disabled"
+            self.log_keyword.configure(state=filter_state)
+            self.log_level.configure(state=filter_state)
         self._set_file_controls()
 
     def _enable_file_drop(self) -> None:
@@ -500,10 +544,10 @@ class App(ctk.CTkFrame):
         self.drop_zone.configure(border_width=self._drop_border_width, border_color=self._drop_border_color)
 
     def _transfer_blocked(self) -> bool:
-        return self._installing or self._recording
+        return self._installing or self._recording or self._logging
 
     def _on_screenshot(self) -> None:
-        if not self._installable or not self._serial or self._installing or self._capturing:
+        if not self._installable or not self._serial or self._installing or self._capturing or self._logging:
             self._set_status(self._block_message, error=True, force=True)
             return
         self._capturing = True
@@ -552,7 +596,7 @@ class App(ctk.CTkFrame):
             self.record_button.configure(state="disabled")
             self._set_status("正在停止录屏…", force=True)
             return
-        if not self._installable or not self._serial or self._installing or self._capturing:
+        if not self._installable or not self._serial or self._installing or self._capturing or self._logging:
             self._set_status(self._block_message, error=True, force=True)
             return
         self._recording = True
@@ -624,11 +668,110 @@ class App(ctk.CTkFrame):
         self._suppress_query_status = True
         self._set_status(message, error=error, force=True)
 
+    def _on_log(self) -> None:
+        if self._logging:
+            if self._log_stopping:
+                return
+            self._log_stopping = True
+            self._log_stop.set()
+            self.log_button.configure(state="disabled")
+            self._set_status("正在停止抓取日志…", force=True)
+            return
+        if not self._installable or not self._serial or self._installing or self._capturing or self._recording:
+            self._set_status(self._block_message, error=True, force=True)
+            return
+        keyword = self.log_keyword.get().strip()
+        level = _LOG_LEVEL_BY_LABEL[self.log_level.get()]
+        self._logging = True
+        self._log_stopping = False
+        stop_event = threading.Event()
+        self._log_stop = stop_event
+        serial = self._serial
+        self.log_button.configure(text="停止", state="normal")
+        self._update_capture_buttons()
+        self._set_status("正在开始抓取日志…", force=True)
+        threading.Thread(
+            target=self._log_worker,
+            args=(serial, keyword, level, stop_event),
+            daemon=True,
+        ).start()
+
+    def _log_worker(self, serial: str, keyword: str, level: str, stop_event: threading.Event) -> None:
+        if stop_event.is_set():
+            self._post_log_finish("", False, None)
+            return
+        try:
+            capture = start_logcat(serial, keyword=keyword, level=level)
+        except DensityError as err:
+            self._post_log_finish(str(err), True, None)
+            return
+        self._post_log_started(stop_event)
+        while capture.process.poll() is None and not stop_event.is_set():
+            stop_event.wait(0.2)
+        try:
+            path = stop_logcat(capture)
+            message = f"已保存并打开 {path}"
+            error = False
+        except DensityError as err:
+            path = None
+            message = str(err)
+            error = True
+        self._post_log_finish(message, error, path)
+
+    def _post_log_started(self, stop_event: threading.Event) -> None:
+        try:
+            self.after(0, lambda stop_event=stop_event: self._show_logging(stop_event))
+        except (tkinter.TclError, RuntimeError):
+            stop_event.set()
+
+    def _show_logging(self, stop_event: threading.Event) -> None:
+        if stop_event.is_set() or not self._logging or self._log_stop is not stop_event:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except tkinter.TclError:
+            return
+        self._update_capture_buttons()
+        self._set_status(f"正在抓取日志，点停止后保存到 {SAVE_DIR}", force=True)
+
+    def _post_log_finish(self, message: str, error: bool, path: Path | None) -> None:
+        try:
+            self.after(0, lambda message=message, error=error, path=path: self._finish_log(message, error, path))
+        except (tkinter.TclError, RuntimeError):
+            self._logging = False
+            self._log_stopping = False
+            if path is not None and not error:
+                _open_text(path)
+
+    def _finish_log(self, message: str, error: bool, path: Path | None) -> None:
+        self._logging = False
+        self._log_stopping = False
+        try:
+            alive = self.winfo_exists()
+        except tkinter.TclError:
+            alive = False
+        if not alive:
+            if path is not None and not error:
+                _open_text(path)
+            return
+        self._update_capture_buttons()
+        if path is not None and not error:
+            try:
+                os.startfile(path)
+            except OSError:
+                message = f"已保存到 {path}，无法打开"
+                error = True
+        if not message:
+            return
+        self._suppress_query_status = True
+        self._set_status(message, error=error, force=True)
+
     def _on_browse(self) -> None:
         if self._browser_open():
             self._raise_browser()
             return
-        if not self._installable or not self._serial or self._installing or self._capturing or self._recording:
+        if not self._installable or not self._serial or self._installing or self._capturing or self._recording or self._logging:
             self._set_status(self._block_message, error=True, force=True)
             return
         self._remote_path = "/sdcard"
@@ -986,9 +1129,17 @@ class App(ctk.CTkFrame):
             and self._serial
             and not self._installing
             and not self._recording
+            and not self._logging
             and not self._saving
             and not self._listing
         )
+
+
+def _open_text(path: Path) -> None:
+    try:
+        os.startfile(path)
+    except OSError:
+        return
 
 
 def _remote_parent(path: str) -> str | None:

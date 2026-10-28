@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
+from typing import BinaryIO
 
 
 class DensityError(Exception):
@@ -66,6 +67,21 @@ class Recording:
 
 
 @dataclass(frozen=True)
+class LogCapture:
+    """正在进行的 logcat 采集。path 是本机文本。"""
+
+    serial: str
+    path: Path
+    process: subprocess.Popen[bytes]
+    errors: bytearray
+    reader: threading.Thread
+    err_reader: threading.Thread
+    handle: BinaryIO
+    lock: threading.Lock
+    lines: list[int]
+
+
+@dataclass(frozen=True)
 class RemoteEntry:
     """手机目录中的一项。path 是绝对路径。"""
 
@@ -106,7 +122,10 @@ _RECORD_LIMIT_SECONDS = "180"
 _SCREENSHOT_TIMEOUT = "截屏超时"
 _SAVE_TIMEOUT = "保存超时"
 _RECORD_TIMEOUT = "停止录屏超时"
+_LOG_TIMEOUT = "停止抓取日志超时"
 _LIST_TIMEOUT = "读取目录超时"
+_LOG_LEVELS = frozenset({"V", "D", "I", "W", "E", "F"})
+_LOG_BOM = b"\xef\xbb\xbf"
 
 
 def bucket_for(dpi: int) -> tuple[str, str]:
@@ -382,6 +401,107 @@ def stop_recording(recording: Recording, *, timeout: float = 30) -> Path:
         _remove_remote(adb, recording.serial, recording.remote)
 
 
+def start_logcat(serial: str, *, keyword: str = "", level: str = "V") -> LogCapture:
+    """开始把 logcat 写入本机文本。等级为该级及以上，关键字在本机按行过滤。"""
+    chosen = level.strip().upper()
+    if chosen not in _LOG_LEVELS:
+        raise DensityError("无法识别的日志等级")
+    adb = find_adb()
+    path = _reserve_path("日志", ".txt")
+    try:
+        handle = path.open("wb")
+    except OSError:
+        path.unlink(missing_ok=True)
+        raise DensityError("无法保存文件") from None
+    try:
+        handle.write(_LOG_BOM)
+        process = _popen_output(
+            adb,
+            ["-s", serial, "logcat", "-v", "threadtime", "-T", "1", f"*:{chosen}"],
+        )
+    except DensityError:
+        handle.close()
+        path.unlink(missing_ok=True)
+        raise
+    except OSError:
+        handle.close()
+        path.unlink(missing_ok=True)
+        raise DensityError("无法保存文件") from None
+    errors = bytearray()
+    lines = [0]
+    lock = threading.Lock()
+    err_reader = threading.Thread(target=_read_stream, args=(process.stderr, errors), daemon=True)
+    reader = threading.Thread(
+        target=_read_logcat,
+        args=(process.stdout, handle, lock, lines, keyword),
+        daemon=True,
+    )
+    err_reader.start()
+    reader.start()
+    capture = LogCapture(
+        serial=serial,
+        path=path,
+        process=process,
+        errors=errors,
+        reader=reader,
+        err_reader=err_reader,
+        handle=handle,
+        lock=lock,
+        lines=lines,
+    )
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        return capture
+    reader.join(timeout=1)
+    err_reader.join(timeout=1)
+    _close_log_handle(capture)
+    if lines[0] > 0:
+        return capture
+    path.unlink(missing_ok=True)
+    raise DensityError(_capture_failure(errors.decode("utf-8", errors="replace"), "抓取日志失败"))
+
+
+def stop_logcat(capture: LogCapture, *, timeout: float = 5) -> Path:
+    """结束 logcat，返回已写入的本机文本。进程自己退出且没有日志时视为失败。"""
+    process = capture.process
+    died_on_its_own = process.poll() is not None
+    try:
+        if not died_on_its_own:
+            process.terminate()
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    raise DensityError(_LOG_TIMEOUT) from None
+        stdout = process.stdout
+        if stdout is not None:
+            try:
+                stdout.close()
+            except OSError:
+                pass
+        capture.reader.join(timeout=2)
+        capture.err_reader.join(timeout=1)
+    finally:
+        _close_log_handle(capture)
+    if died_on_its_own and capture.lines[0] == 0:
+        detail = capture.errors.decode("utf-8", errors="replace")
+        capture.path.unlink(missing_ok=True)
+        raise DensityError(_capture_failure(detail, "抓取日志失败"))
+    return capture.path
+
+
+def _close_log_handle(capture: LogCapture) -> None:
+    with capture.lock:
+        if capture.handle.closed:
+            return
+        capture.handle.flush()
+        capture.handle.close()
+
+
 def _stop_record_process(recording: Recording, adb: str, timeout: float) -> None:
     process = recording.process
     if process.poll() is not None:
@@ -492,10 +612,49 @@ def _popen(adb: str, args: list[str]) -> subprocess.Popen[bytes]:
         raise DensityError("无法启动 adb") from None
 
 
+def _popen_output(adb: str, args: list[str]) -> subprocess.Popen[bytes]:
+    """启动 adb 并保留标准输出，供 logcat 这类持续输出使用。"""
+    kwargs: dict = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        return subprocess.Popen(
+            [adb, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **kwargs,
+        )
+    except OSError:
+        raise DensityError("无法启动 adb") from None
+
+
 def _read_stream(stream, sink: bytearray) -> None:
     if stream is None:
         return
     sink.extend(stream.read())
+
+
+def _read_logcat(stream, handle: BinaryIO, lock: threading.Lock, lines: list[int], keyword: str) -> None:
+    if stream is None:
+        return
+    needle = keyword.strip().casefold()
+    try:
+        for raw in stream:
+            text = raw.decode("utf-8", errors="replace")
+            if needle and needle not in text.casefold():
+                continue
+            data = text.encode("utf-8")
+            with lock:
+                if handle.closed:
+                    return
+                handle.write(data)
+                handle.flush()
+                lines[0] += 1
+    finally:
+        with lock:
+            if not handle.closed:
+                handle.flush()
 
 
 def _screenshot_via_pull(adb: str, serial: str, timeout: float, prior_error: str) -> Path:
