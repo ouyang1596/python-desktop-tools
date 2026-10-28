@@ -413,7 +413,7 @@ def start_logcat(
     app_only: bool = False,
     clear: bool = False,
 ) -> LogCapture:
-    """开始把 logcat 写入本机文本。等级为该级及以上，关键字在本机按行过滤。"""
+    """开始把 logcat 写入本机文本。等级为该级及以上，关键字在本机按行做「或」过滤，多段用 | 分隔。"""
     chosen = level.strip().upper()
     if chosen not in _LOG_LEVELS:
         raise DensityError("无法识别的日志等级")
@@ -704,11 +704,12 @@ def _read_stream(stream, sink: bytearray) -> None:
 def _read_logcat(stream, handle: BinaryIO, lock: threading.Lock, lines: list[int], keyword: str) -> None:
     if stream is None:
         return
-    needle = keyword.strip().casefold()
+    needles = tuple(part.casefold() for part in (item.strip() for item in keyword.split("|")) if part)
     try:
         for raw in stream:
             text = raw.decode("utf-8", errors="replace")
-            if needle and needle not in text.casefold():
+            folded = text.casefold()
+            if needles and not any(needle in folded for needle in needles):
                 continue
             data = text.encode("utf-8")
             with lock:

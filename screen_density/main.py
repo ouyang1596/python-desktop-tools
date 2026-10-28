@@ -207,7 +207,7 @@ class App(ctk.CTkFrame):
         log_row = ctk.CTkFrame(device, fg_color="transparent")
         log_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 8))
         self.log_keyword = ctk.CTkEntry(
-            log_row, placeholder_text="关键字，可留空", font=FONT, width=220, state="disabled"
+            log_row, placeholder_text="关键字，多个用 | 分隔", font=FONT, width=220, state="disabled"
         )
         self.log_keyword.pack(side="left")
         self.log_level = ctk.CTkOptionMenu(
