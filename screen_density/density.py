@@ -79,6 +79,7 @@ class LogCapture:
     handle: BinaryIO
     lock: threading.Lock
     lines: list[int]
+    package: str
 
 
 @dataclass(frozen=True)
@@ -123,9 +124,12 @@ _SCREENSHOT_TIMEOUT = "截屏超时"
 _SAVE_TIMEOUT = "保存超时"
 _RECORD_TIMEOUT = "停止录屏超时"
 _LOG_TIMEOUT = "停止抓取日志超时"
+_LOG_CLEAR_TIMEOUT = "清空日志缓冲超时"
+_APP_TIMEOUT = "读取当前应用超时"
 _LIST_TIMEOUT = "读取目录超时"
 _LOG_LEVELS = frozenset({"V", "D", "I", "W", "E", "F"})
 _LOG_BOM = b"\xef\xbb\xbf"
+_PKG_BEFORE_SLASH = re.compile(r"([a-zA-Z][\w]*(?:\.[a-zA-Z_][\w]*)+)/")
 
 
 def bucket_for(dpi: int) -> tuple[str, str]:
@@ -401,12 +405,28 @@ def stop_recording(recording: Recording, *, timeout: float = 30) -> Path:
         _remove_remote(adb, recording.serial, recording.remote)
 
 
-def start_logcat(serial: str, *, keyword: str = "", level: str = "V") -> LogCapture:
+def start_logcat(
+    serial: str,
+    *,
+    keyword: str = "",
+    level: str = "V",
+    app_only: bool = False,
+    clear: bool = False,
+) -> LogCapture:
     """开始把 logcat 写入本机文本。等级为该级及以上，关键字在本机按行过滤。"""
     chosen = level.strip().upper()
     if chosen not in _LOG_LEVELS:
         raise DensityError("无法识别的日志等级")
     adb = find_adb()
+    package = ""
+    pids: list[str] = []
+    if app_only:
+        package = _foreground_package(adb, serial)
+        pids = _app_pids(adb, serial, package)
+        if not pids:
+            raise DensityError(f"当前应用没有在运行：{package}")
+    if clear:
+        _clear_logcat(adb, serial)
     path = _reserve_path("日志", ".txt")
     try:
         handle = path.open("wb")
@@ -415,10 +435,7 @@ def start_logcat(serial: str, *, keyword: str = "", level: str = "V") -> LogCapt
         raise DensityError("无法保存文件") from None
     try:
         handle.write(_LOG_BOM)
-        process = _popen_output(
-            adb,
-            ["-s", serial, "logcat", "-v", "threadtime", "-T", "1", f"*:{chosen}"],
-        )
+        process = _popen_output(adb, _logcat_args(serial, chosen, pids))
     except DensityError:
         handle.close()
         path.unlink(missing_ok=True)
@@ -448,6 +465,7 @@ def start_logcat(serial: str, *, keyword: str = "", level: str = "V") -> LogCapt
         handle=handle,
         lock=lock,
         lines=lines,
+        package=package,
     )
     try:
         process.wait(timeout=0.5)
@@ -492,6 +510,54 @@ def stop_logcat(capture: LogCapture, *, timeout: float = 5) -> Path:
         capture.path.unlink(missing_ok=True)
         raise DensityError(_capture_failure(detail, "抓取日志失败"))
     return capture.path
+
+
+def _logcat_args(serial: str, level: str, pids: list[str]) -> list[str]:
+    args = ["-s", serial, "logcat", "-v", "threadtime", "-T", "1"]
+    args.extend(f"--pid={pid}" for pid in pids)
+    args.append(f"*:{level}")
+    return args
+
+
+def _foreground_package(adb: str, serial: str) -> str:
+    stdout, stderr, code = _execute(adb, ["-s", serial, "shell", "dumpsys", "window"], 15, _APP_TIMEOUT)
+    if code != 0 and not stdout.strip():
+        raise DensityError(_capture_failure(stderr, "无法识别当前应用"))
+    package = _parse_foreground_package(stdout)
+    if not package:
+        raise DensityError("无法识别当前应用")
+    return package
+
+
+def _parse_foreground_package(text: str) -> str | None:
+    """从 dumpsys window 里取前台包名。mCurrentFocus 为空时用 mFocusedApp。"""
+    return _labeled_package(text, "mCurrentFocus=") or _labeled_package(text, "mFocusedApp=")
+
+
+def _labeled_package(text: str, label: str) -> str | None:
+    for line in text.splitlines():
+        if label not in line:
+            continue
+        match = _PKG_BEFORE_SLASH.search(line)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _app_pids(adb: str, serial: str, package: str) -> list[str]:
+    stdout, stderr, code = _execute(adb, ["-s", serial, "shell", "pidof", package], 10, _APP_TIMEOUT)
+    pids = re.findall(r"\d+", stdout)
+    if pids:
+        return pids
+    if code != 0 and stderr.strip():
+        raise DensityError(_capture_failure(stderr, "无法识别当前应用"))
+    return []
+
+
+def _clear_logcat(adb: str, serial: str) -> None:
+    stdout, stderr, code = _execute(adb, ["-s", serial, "logcat", "-c"], 10, _LOG_CLEAR_TIMEOUT)
+    if code != 0:
+        raise DensityError(_capture_failure(stderr or stdout, "清空日志失败"))
 
 
 def _close_log_handle(capture: LogCapture) -> None:
