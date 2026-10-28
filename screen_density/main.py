@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -33,6 +34,7 @@ from screen_density.density import (
     push_file,
     start_logcat,
     start_recording,
+    start_scrcpy,
     stop_logcat,
     stop_recording,
 )
@@ -104,6 +106,7 @@ class App(ctk.CTkFrame):
         self._thumb_lock = threading.Lock()
         self._thumb_buttons: dict[str, ctk.CTkButton] = {}
         self._browser: ctk.CTkToplevel | None = None
+        self._mirrors: dict[str, subprocess.Popen[bytes]] = {}
         self._browser_needs_reload = False
         self._drag_inside = 0
         self._suppress_query_status = False
@@ -203,6 +206,10 @@ class App(ctk.CTkFrame):
             actions, text="文件浏览", width=96, command=self._on_browse, state="disabled"
         )
         self.browse_button.pack(side="left", padx=(8, 0))
+        self.mirror_button = ctk.CTkButton(
+            actions, text="投屏", width=88, command=self._on_mirror, state="disabled"
+        )
+        self.mirror_button.pack(side="left", padx=(8, 0))
 
         log_row = ctk.CTkFrame(device, fg_color="transparent")
         log_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 8))
@@ -411,6 +418,7 @@ class App(ctk.CTkFrame):
             self.record_button.configure(text="录屏", state="normal" if ready and not self._logging else "disabled")
         can_browse = ready and not self._recording and not self._logging
         self.browse_button.configure(state="normal" if can_browse else "disabled")
+        self.mirror_button.configure(state="normal" if self._installable else "disabled")
         if self._logging:
             self.log_button.configure(text="停止", state="disabled" if self._log_stopping else "normal")
             self.log_keyword.configure(state="disabled")
@@ -778,6 +786,28 @@ class App(ctk.CTkFrame):
             return
         self._suppress_query_status = True
         self._set_status(message, error=error, force=True)
+
+    def _on_mirror(self) -> None:
+        serial = self._serial
+        if not serial or not self._installable:
+            self._set_status(self._block_message, error=True, force=True)
+            return
+        running = self._live_mirror(serial)
+        if running is not None:
+            self._set_status("scrcpy 已在运行", force=True)
+            return
+        try:
+            self._mirrors[serial] = start_scrcpy(serial)
+        except DensityError as err:
+            self._set_status(str(err), error=True, force=True)
+            return
+        self._set_status("已启动 scrcpy", force=True)
+
+    def _live_mirror(self, serial: str) -> subprocess.Popen[bytes] | None:
+        finished = [key for key, process in self._mirrors.items() if process.poll() is not None]
+        for key in finished:
+            del self._mirrors[key]
+        return self._mirrors.get(serial)
 
     def _on_browse(self) -> None:
         if self._browser_open():

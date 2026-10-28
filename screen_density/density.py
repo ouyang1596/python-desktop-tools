@@ -118,6 +118,7 @@ _REMOTE_DIR = "/sdcard"
 _FAILURE = re.compile(r"Failure \[[^\]]+\]")
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 SAVE_DIR = Path(r"D:\adb")
+SCRCPY_EXE = Path(r"D:\soft\scrcpy-win64-v5.0.1\scrcpy.exe")
 _PNG_MAGIC = b"\x89PNG"
 _RECORD_LIMIT_SECONDS = "180"
 _SCREENSHOT_TIMEOUT = "截屏超时"
@@ -238,6 +239,22 @@ def find_adb() -> str:
         if path.is_file():
             return str(path)
     raise DensityError(_NO_ADB)
+
+
+def start_scrcpy(serial: str) -> subprocess.Popen[bytes]:
+    """启动 scrcpy 镜像指定手机。同一设备是否已在运行由调用方判断。"""
+    if not SCRCPY_EXE.is_file():
+        raise DensityError(f"未找到 scrcpy：{SCRCPY_EXE}")
+    env = os.environ.copy()
+    env["ADB"] = find_adb()
+    try:
+        return subprocess.Popen(
+            [str(SCRCPY_EXE), "-s", serial],
+            cwd=str(SCRCPY_EXE.parent),
+            env=env,
+        )
+    except OSError:
+        raise DensityError("无法启动 scrcpy") from None
 
 
 def probe(serial: str | None = None, *, timeout: float = 10) -> ProbeResult:

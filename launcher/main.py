@@ -58,7 +58,7 @@ TOOLS = (
     {
         "key": "density",
         "title": "ADB",
-        "description": "查看 xh/xxh，安装 apk，截屏录屏，抓取日志，浏览手机文件并保存到 D:\\adb",
+        "description": "查看 xh/xxh，安装 apk，截屏录屏投屏，抓取日志，浏览手机文件并保存到 D:\\adb",
     },
     {
         "key": "apk",
