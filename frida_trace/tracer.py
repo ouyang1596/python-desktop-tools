@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import importlib.util
-import importlib.util
 import json
+import os
+import re
 import socket
 import threading
 from pathlib import Path
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable
 
 from adbutils import AdbClient
 from adbutils.errors import AdbError
 
-from screen_density.density import DensityError, Device, find_adb
+from screen_density.density import SAVE_DIR, DensityError, Device, find_adb
 
 
 class TraceError(Exception):
@@ -347,6 +348,230 @@ def format_hit(payload: dict, *, now: datetime | None = None) -> str:
 
 def not_running_message(package: str) -> str:
     return f"请先打开 {package}，点刷新后再开始"
+
+
+_TIME_LINE = re.compile(r"^(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})(?:\.\d+)?\s+\S")
+_STATUS_PREFIXES = ("开始挂钩", "已挂钩", "失败：", "失败:", "未找到")
+_HOOK_TARGET = re.compile(r"^开始挂钩\s+(\S+)\s+/")
+_PROP_LINE = re.compile(r"^\[([^\]]+)\]: \[(.*)\]$")
+
+
+def save_trace_log(
+    text: str,
+    *,
+    now: datetime | None = None,
+    serial: str = "",
+    model: str = "",
+    package: str = "",
+    process: str = "",
+    pid: int = 0,
+) -> Path:
+    """把调用日志写成 Android Studio 可打开的 .logcat，保存到 D:\\adb。"""
+    moment = now or datetime.now()
+    logged = _package_from_log(text)
+    app_id = logged or package.strip()
+    if process.strip() and (not logged or logged == package.strip()):
+        process_name = process.strip()
+    else:
+        process_name = app_id
+    if logged and logged != package.strip():
+        pid = 0
+    document = _logcat_document(
+        text,
+        now=moment,
+        serial=serial.strip(),
+        model=model.strip(),
+        package=app_id,
+        process=process_name,
+        pid=pid,
+    )
+    payload = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = moment.strftime("%Y%m%d_%H%M%S")
+    names = [f"frida_{stamp}.logcat"]
+    names.extend(f"frida_{stamp}_{index}.logcat" for index in range(2, 100))
+    for name in names:
+        path = SAVE_DIR / name
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue
+        try:
+            os.write(fd, payload)
+        except OSError:
+            os.close(fd)
+            path.unlink(missing_ok=True)
+            raise
+        os.close(fd)
+        return path
+    raise TraceError("无法保存日志")
+
+
+def _package_from_log(text: str) -> str:
+    for line in text.splitlines():
+        match = _HOOK_TARGET.match(line.strip())
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _logcat_document(
+    text: str,
+    *,
+    now: datetime,
+    serial: str,
+    model: str,
+    package: str,
+    process: str,
+    pid: int,
+) -> dict:
+    messages = [_beginning_message()]
+    seen_seconds: dict[int, int] = {}
+    for moment, body in _stamp_blocks(_log_blocks(text), now):
+        seconds = int(moment.timestamp())
+        nanos = seen_seconds.get(seconds, 0)
+        seen_seconds[seconds] = nanos + 1_000_000
+        messages.append(
+            {
+                "header": {
+                    "logLevel": "ERROR" if body.startswith("失败") else "INFO",
+                    "pid": pid if pid > 0 else 0,
+                    "tid": pid if pid > 0 else 0,
+                    "applicationId": package,
+                    "processName": process,
+                    "tag": "Frida",
+                    "timestamp": {"seconds": seconds, "nanos": nanos},
+                },
+                "message": body,
+            }
+        )
+    return {
+        "metadata": {
+            "device": {"physicalDevice": _physical_device(serial, model)},
+            "filter": "",
+            "projectApplicationIds": [package] if package else [],
+        },
+        "logcatMessages": messages,
+    }
+
+
+def _beginning_message() -> dict:
+    return {
+        "header": {
+            "logLevel": "INFO",
+            "pid": 0,
+            "tid": 0,
+            "applicationId": "",
+            "processName": "",
+            "tag": "",
+            "timestamp": {"seconds": 0, "nanos": 0},
+        },
+        "message": "--------- beginning of main",
+    }
+
+
+def _physical_device(serial: str, model: str) -> dict:
+    props = _device_props(serial)
+    sdk_text = props.get("ro.build.version.sdk", "")
+    try:
+        sdk = int(sdk_text)
+    except ValueError:
+        sdk = 0
+    return {
+        "serialNumber": serial,
+        "isOnline": True,
+        "release": props.get("ro.build.version.release", ""),
+        "apiLevel": {"majorVersion": sdk, "minorVersion": 0},
+        "featureLevel": sdk,
+        "manufacturer": props.get("ro.product.manufacturer", ""),
+        "model": props.get("ro.product.model", "") or model,
+        "type": "HANDHELD",
+    }
+
+
+def _device_props(serial: str) -> dict[str, str]:
+    if not serial:
+        return {}
+    try:
+        raw = AdbClient(socket_timeout=3).device(serial).shell("getprop", timeout=3)
+    except (AdbError, OSError, socket.timeout, TimeoutError, ValueError, TypeError):
+        return {}
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    props: dict[str, str] = {}
+    for line in str(raw).splitlines():
+        match = _PROP_LINE.match(line.strip())
+        if match:
+            props[match.group(1)] = match.group(2)
+    return props
+
+
+def _log_blocks(text: str) -> list[tuple[tuple[int, int, int] | None, str]]:
+    blocks: list[list[str]] = []
+    clocks: list[tuple[int, int, int] | None] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        if not line.strip():
+            current = None
+            continue
+        if current is None or _is_log_entry(line):
+            current = [line]
+            blocks.append(current)
+            clocks.append(_clock_from_line(line))
+        else:
+            current.append(line)
+    result: list[tuple[tuple[int, int, int] | None, str]] = []
+    for clock, lines in zip(clocks, blocks):
+        body = "\n".join(lines).strip()
+        if body:
+            result.append((clock, body))
+    if not result and text.strip():
+        result.append((None, text.strip()))
+    return result
+
+
+def _is_log_entry(line: str) -> bool:
+    stripped = line.strip()
+    return _TIME_LINE.match(stripped) is not None or stripped.startswith(_STATUS_PREFIXES)
+
+
+def _clock_from_line(line: str) -> tuple[int, int, int] | None:
+    match = _TIME_LINE.match(line.strip())
+    if match is None:
+        return None
+    return int(match.group("h")), int(match.group("m")), int(match.group("s"))
+
+
+def _stamp_blocks(
+    blocks: list[tuple[tuple[int, int, int] | None, str]],
+    now: datetime,
+) -> list[tuple[datetime, str]]:
+    parsed: list[datetime | None] = []
+    for clock, _body in blocks:
+        if clock is None:
+            parsed.append(None)
+            continue
+        hour, minute, second = clock
+        moment = now.replace(hour=hour, minute=minute, second=second, microsecond=0)
+        if moment > now + timedelta(minutes=2):
+            moment -= timedelta(days=1)
+        parsed.append(moment)
+    timed = [item for item in parsed if item is not None]
+    anchor = min(timed) if timed else now
+    leading = 0
+    for item in parsed:
+        if item is not None:
+            break
+        leading += 1
+    start = anchor - timedelta(seconds=leading)
+    stamped: list[tuple[datetime, str]] = []
+    for index, ((_clock, body), moment) in enumerate(zip(blocks, parsed)):
+        if moment is None and index < leading:
+            moment = start + timedelta(seconds=index)
+        elif moment is None:
+            moment = now
+        stamped.append((moment, body))
+    return stamped
 
 
 class Tracer:

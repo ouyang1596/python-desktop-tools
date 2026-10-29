@@ -14,7 +14,7 @@ import customtkinter as ctk
 
 from screen_density.density import Device, device_label
 
-from frida_trace.tracer import AppInfo, TraceError, Tracer, format_hit, list_apps, list_devices
+from frida_trace.tracer import AppInfo, TraceError, Tracer, format_hit, list_apps, list_devices, save_trace_log
 
 FONT = ("Microsoft YaHei UI", 13)
 FONT_SM = ("Microsoft YaHei UI", 12)
@@ -509,8 +509,29 @@ class App(ctk.CTkFrame):
         self._tracing = False
         self._tracer.stop()
         self._set_stop_enabled(False)
-        if was:
+        if not was:
+            return
+        text = self.log_box.get("1.0", "end-1c")
+        if not text.strip():
             self._set_status("已停止")
+            return
+        phone = self._selected_phone()
+        package = self._package(self.class_entry.get().strip())
+        app = next((item for item in self._app_infos if item.package == package), None)
+        try:
+            path = save_trace_log(
+                text,
+                serial=phone.serial if phone else "",
+                model=phone.model if phone else "",
+                package=package,
+                process=app.name if app and app.name else "",
+                pid=app.pid if app else 0,
+            )
+        except (OSError, TraceError) as err:
+            detail = str(err).splitlines()[0] if str(err) else "无法保存日志"
+            self._set_status(f"已停止，保存日志失败：{detail}", error=True)
+            return
+        self._set_status(f"已停止，日志已保存到 {path}")
 
     def _on_event(self, token: int, payload: dict) -> None:
         try:
