@@ -26,6 +26,176 @@ VALUE_COLOR = ("gray10", "gray90")
 EMPTY_COLOR = ("gray50", "gray60")
 _NO_PHONE = "未连接"
 _NO_APP = "没有正在运行的应用"
+_LIST_ROWS = 12
+
+
+def _widget_inside(widget, parent) -> bool:
+    current = widget
+    while current is not None:
+        if current == parent:
+            return True
+        current = getattr(current, "master", None)
+    return False
+
+
+class AppMenu(ctk.CTkFrame):
+    """可输入的应用框。下拉是列表而不是系统菜单，能用滚轮滑动。"""
+
+    def __init__(self, master) -> None:
+        super().__init__(master, fg_color="transparent")
+        self.grid_columnconfigure(0, weight=1)
+        self._values: list[str] = [_NO_APP]
+        self._popup: tkinter.Toplevel | None = None
+        self._listbox: tkinter.Listbox | None = None
+        self._click_id: str | None = None
+        self.entry = ctk.CTkEntry(self, font=FONT_CODE, height=32)
+        self.entry.grid(row=0, column=0, sticky="ew")
+        self._button = ctk.CTkButton(self, text="▼", width=32, height=32, font=FONT, command=self._toggle)
+        self._button.grid(row=0, column=1, padx=(6, 0))
+
+    def get(self) -> str:
+        return self.entry.get()
+
+    def set(self, value: str) -> None:
+        self.entry.delete(0, "end")
+        if value:
+            self.entry.insert(0, value)
+
+    def configure(self, **kwargs):
+        values = kwargs.pop("values", None)
+        if values is not None:
+            self._values = [str(item) for item in values] or [_NO_APP]
+            self.close()
+        if kwargs:
+            super().configure(**kwargs)
+
+    def close(self) -> None:
+        self._unbind_click()
+        popup = self._popup
+        self._popup = None
+        self._listbox = None
+        if popup is None:
+            return
+        try:
+            popup.destroy()
+        except tkinter.TclError:
+            pass
+
+    def _toggle(self) -> None:
+        if self._popup is not None:
+            self.close()
+            return
+        self._open()
+
+    def _open(self) -> None:
+        self.close()
+        values = self._values or [_NO_APP]
+        bg, fg, select = self._list_colors()
+        popup = tkinter.Toplevel(self)
+        popup.withdraw()
+        popup.overrideredirect(True)
+        try:
+            popup.transient(self.winfo_toplevel())
+        except tkinter.TclError:
+            pass
+        popup.configure(bg=bg)
+        visible = min(_LIST_ROWS, len(values))
+        listbox = tkinter.Listbox(
+            popup,
+            font=FONT_SM,
+            height=visible,
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            exportselection=False,
+            bg=bg,
+            fg=fg,
+            selectbackground=select,
+            selectforeground=fg,
+        )
+        for value in values:
+            listbox.insert("end", value)
+        scroll = ctk.CTkScrollbar(popup, command=listbox.yview)
+        listbox.configure(yscrollcommand=scroll.set)
+        listbox.grid(row=0, column=0, sticky="nsew")
+        popup.grid_columnconfigure(0, weight=1)
+        popup.grid_rowconfigure(0, weight=1)
+        if len(values) > visible:
+            scroll.grid(row=0, column=1, sticky="ns")
+        listbox.bind("<ButtonRelease-1>", self._choose)
+        listbox.bind("<MouseWheel>", self._on_wheel)
+        listbox.bind("<Escape>", lambda _event: self.close())
+        popup.bind("<Escape>", lambda _event: self.close())
+        self._popup = popup
+        self._listbox = listbox
+        self.update_idletasks()
+        popup.update_idletasks()
+        self._bind_wheel(scroll)
+        width = max(self.winfo_width(), popup.winfo_reqwidth(), 280)
+        height = max(popup.winfo_reqheight(), listbox.winfo_reqheight() + 4)
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height()
+        screen_h = self.winfo_screenheight()
+        if y + height > screen_h - 8:
+            y = max(0, self.winfo_rooty() - height)
+        popup.geometry(f"{width}x{height}+{x}+{y}")
+        popup.deiconify()
+        popup.lift()
+        listbox.focus_set()
+        self._click_id = tkinter.Misc.bind_all(self, "<Button-1>", self._on_global_click, add="+")
+
+    def _choose(self, _event=None) -> None:
+        listbox = self._listbox
+        if listbox is None:
+            return
+        selected = listbox.curselection()
+        if not selected:
+            return
+        self.set(listbox.get(selected[0]))
+        self.close()
+
+    def _on_wheel(self, event) -> str:
+        listbox = self._listbox
+        if listbox is None:
+            return "break"
+        steps = int(event.delta / 120) or (1 if event.delta > 0 else -1)
+        listbox.yview_scroll(-steps, "units")
+        return "break"
+
+    def _bind_wheel(self, widget) -> None:
+        widget.bind("<MouseWheel>", self._on_wheel)
+        for child in widget.winfo_children():
+            self._bind_wheel(child)
+
+    def _on_global_click(self, event) -> None:
+        popup = self._popup
+        if popup is None:
+            return
+        if _widget_inside(event.widget, popup) or _widget_inside(event.widget, self._button):
+            return
+        self.close()
+
+    def _unbind_click(self) -> None:
+        funcid = self._click_id
+        self._click_id = None
+        _unbind_all(self, "<Button-1>", funcid)
+
+    def _list_colors(self) -> tuple[str, str, str]:
+        theme = ctk.ThemeManager.theme
+        bg = self._apply_appearance_mode(theme["CTkFrame"]["fg_color"])
+        fg = self._apply_appearance_mode(theme["CTkLabel"]["text_color"])
+        select = self._apply_appearance_mode(theme["CTkButton"]["fg_color"])
+        return str(bg), str(fg), str(select)
+
+
+def _unbind_all(widget, sequence: str, funcid: str | None) -> None:
+    if not funcid:
+        return
+    try:
+        root = widget.winfo_toplevel()
+    except tkinter.TclError:
+        return
+    tkinter.Misc._unbind(root, ("bind", "all", sequence), funcid)
 
 
 class App(ctk.CTkFrame):
@@ -58,6 +228,7 @@ class App(ctk.CTkFrame):
         self._tracing = False
         self._tracer.stop()
         self._set_stop_enabled(False)
+        self.app_menu.close()
         self._cancel_arm()
 
     def grid(self, *args, **kwargs):
@@ -115,7 +286,7 @@ class App(ctk.CTkFrame):
         form.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
         form.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(form, text="应用", font=FONT, anchor="w", width=72).grid(row=0, column=0, sticky="w", pady=(0, 4))
-        self.app_menu = ctk.CTkComboBox(form, values=[_NO_APP], font=FONT_CODE, dropdown_font=FONT_SM)
+        self.app_menu = AppMenu(form)
         self.app_menu.set("")
         self.app_menu.grid(row=0, column=1, sticky="ew", pady=(0, 4))
         ctk.CTkLabel(
