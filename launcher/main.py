@@ -13,6 +13,7 @@ import customtkinter as ctk
 from anim_preview.main import App as AnimPreviewApp
 from apk_info.main import App as ApkInfoApp
 from color_converter.main import App as ColorConverterApp
+from frida_trace.main import App as FridaTraceApp
 from image_compressor.main import App as ImageCompressorApp
 from json_formatter.main import App as JsonFormatterApp
 from screen_density.main import App as ScreenDensityApp
@@ -64,6 +65,11 @@ TOOLS = (
         "key": "apk",
         "title": "APK 信息",
         "description": "查看包名、版本、SDK、ABI 和权限",
+    },
+    {
+        "key": "frida",
+        "title": "Frida",
+        "description": "打印指定 Java 方法的调用堆栈",
     },
 )
 
@@ -140,6 +146,7 @@ class Shell(ctk.CTk):
             "color": ColorConverterApp(self, on_back=self.show_home),
             "density": ScreenDensityApp(self, on_back=self.show_home),
             "apk": ApkInfoApp(self, on_back=self.show_home),
+            "frida": FridaTraceApp(self, on_back=self.show_home),
         }
         self.show_home()
 
