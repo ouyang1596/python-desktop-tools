@@ -130,6 +130,19 @@ _APP_TIMEOUT = "读取当前应用超时"
 _LIST_TIMEOUT = "读取目录超时"
 _LOG_LEVELS = frozenset({"V", "D", "I", "W", "E", "F"})
 _LOG_BOM = b"\xef\xbb\xbf"
+_LOG_EMPTY = "没有匹配到日志"
+_LOG_FLUSH_SECONDS = 0.2
+_LOG_FLUSH_BYTES = 256 * 1024
+_LOG_FORMAT = "threadtime,usec"
+_LOG_FORMAT_PLAIN = "threadtime"
+_LOG_BUFFERS = ("main", "system", "crash")
+_LOG_ARG_ERROR = re.compile(
+    r"invalid format|unknown buffer|unrecognized option|unknown option|invalid option|unknown command|usage: logcat",
+    re.IGNORECASE,
+)
+_LOG_LINE = re.compile(br"\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+_UID_LINE = re.compile(r"^Uid:\s*(\d+)")
+_FOCUS_QUERY = "dumpsys window | grep -e mCurrentFocus= -e mFocusedApp="
 _PKG_BEFORE_SLASH = re.compile(r"([a-zA-Z][\w]*(?:\.[a-zA-Z_][\w]*)+)/")
 
 
@@ -428,77 +441,65 @@ def start_logcat(
     keyword: str = "",
     level: str = "V",
     app_only: bool = False,
-    clear: bool = False,
 ) -> LogCapture:
-    """开始把 logcat 写入本机文本。等级为该级及以上，关键字在本机按行做「或」过滤，多段用 | 分隔。"""
+    """开始把 logcat 写入本机文本。等级为该级及以上；关键字在本机按整行做「或」过滤，多段用 | 分隔。开始前会清空手机上的日志缓冲。"""
     chosen = level.strip().upper()
     if chosen not in _LOG_LEVELS:
         raise DensityError("无法识别的日志等级")
     adb = find_adb()
     package = ""
     pids: list[str] = []
+    uids: list[str] = []
     if app_only:
         package = _foreground_package(adb, serial)
         pids = _app_pids(adb, serial, package)
         if not pids:
             raise DensityError(f"当前应用没有在运行：{package}")
-    if clear:
-        _clear_logcat(adb, serial)
+        uids = _app_uids(adb, serial, pids)
     path = _reserve_path("日志", ".txt")
     try:
-        handle = path.open("wb")
+        handle = path.open("w+b", buffering=_LOG_FLUSH_BYTES)
     except OSError:
         path.unlink(missing_ok=True)
         raise DensityError("无法保存文件") from None
-    try:
-        handle.write(_LOG_BOM)
-        process = _popen_output(adb, _logcat_args(serial, chosen, pids))
-    except DensityError:
-        handle.close()
-        path.unlink(missing_ok=True)
-        raise
-    except OSError:
-        handle.close()
-        path.unlink(missing_ok=True)
-        raise DensityError("无法保存文件") from None
-    errors = bytearray()
     lines = [0]
     lock = threading.Lock()
-    err_reader = threading.Thread(target=_read_stream, args=(process.stderr, errors), daemon=True)
-    reader = threading.Thread(
-        target=_read_logcat,
-        args=(process.stdout, handle, lock, lines, keyword),
-        daemon=True,
-    )
-    err_reader.start()
-    reader.start()
-    capture = LogCapture(
-        serial=serial,
-        path=path,
-        process=process,
-        errors=errors,
-        reader=reader,
-        err_reader=err_reader,
-        handle=handle,
-        lock=lock,
-        lines=lines,
-        package=package,
-    )
+    attempts = _logcat_attempts(serial, chosen, uids, pids)
+    last_errors = bytearray()
     try:
-        process.wait(timeout=0.5)
-    except subprocess.TimeoutExpired:
-        return capture
-    reader.join(timeout=1)
-    err_reader.join(timeout=1)
-    _close_log_handle(capture)
-    if lines[0] > 0:
-        return capture
-    path.unlink(missing_ok=True)
-    raise DensityError(_capture_failure(errors.decode("utf-8", errors="replace"), "抓取日志失败"))
+        handle.write(_LOG_BOM)
+        handle.flush()
+        _clear_logcat(adb, serial)
+        for index, args in enumerate(attempts):
+            if index:
+                _rewind_log_handle(handle, lines, lock)
+            capture = _spawn_logcat(adb, args, serial, path, handle, lines, lock, keyword, package)
+            try:
+                capture.process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                return capture
+            if not _join_log_readers(capture):
+                if _written_log_looks_real(handle):
+                    return capture
+                break
+            last_errors = capture.errors
+            if index + 1 < len(attempts) and _should_retry_logcat(capture):
+                continue
+            if _written_log_looks_real(handle):
+                return capture
+            break
+    except DensityError:
+        _discard_log_file(handle, path)
+        raise
+    except OSError:
+        _discard_log_file(handle, path)
+        raise DensityError("无法保存文件") from None
+    _discard_log_file(handle, path)
+    raise DensityError(_capture_failure(last_errors.decode("utf-8", errors="replace"), "抓取日志失败"))
 
 
 def stop_logcat(capture: LogCapture, *, timeout: float = 5) -> Path:
-    """结束 logcat，返回已写入的本机文本。进程自己退出且没有日志时视为失败。"""
+    """结束 logcat，返回已写入的本机文本。没有日志时视为失败。"""
     process = capture.process
     died_on_its_own = process.poll() is not None
     try:
@@ -518,32 +519,170 @@ def stop_logcat(capture: LogCapture, *, timeout: float = 5) -> Path:
                 stdout.close()
             except OSError:
                 pass
-        capture.reader.join(timeout=2)
+        capture.reader.join(timeout=3)
         capture.err_reader.join(timeout=1)
     finally:
         _close_log_handle(capture)
-    if died_on_its_own and capture.lines[0] == 0:
+    with capture.lock:
+        count = capture.lines[0]
+    if count == 0:
         detail = capture.errors.decode("utf-8", errors="replace")
         capture.path.unlink(missing_ok=True)
-        raise DensityError(_capture_failure(detail, "抓取日志失败"))
+        if died_on_its_own:
+            raise DensityError(_capture_failure(detail, "抓取日志失败"))
+        raise DensityError(_LOG_EMPTY)
     return capture.path
 
 
-def _logcat_args(serial: str, level: str, pids: list[str]) -> list[str]:
-    args = ["-s", serial, "logcat", "-v", "threadtime", "-T", "1"]
-    args.extend(f"--pid={pid}" for pid in pids)
+def _logcat_attempts(
+    serial: str,
+    level: str,
+    uids: list[str],
+    pids: list[str],
+) -> list[list[str]]:
+    preferred = _logcat_command(
+        serial,
+        level,
+        uids=uids,
+        pids=pids,
+        log_format=_LOG_FORMAT,
+        buffers=_LOG_BUFFERS,
+        raw=True,
+    )
+    fallback = _logcat_command(
+        serial,
+        level,
+        uids=[],
+        pids=pids,
+        log_format=_LOG_FORMAT_PLAIN,
+        buffers=(),
+        raw=False,
+    )
+    if fallback == preferred:
+        return [preferred]
+    return [preferred, fallback]
+
+
+def _logcat_command(
+    serial: str,
+    level: str,
+    *,
+    uids: list[str],
+    pids: list[str],
+    log_format: str,
+    buffers: tuple[str, ...],
+    raw: bool,
+) -> list[str]:
+    if raw:
+        args = ["-s", serial, "exec-out", "logcat", "-v", log_format]
+    else:
+        args = ["-s", serial, "logcat", "-v", log_format]
+    for name in buffers:
+        args.extend(["-b", name])
+    if uids:
+        args.extend(f"--uid={uid}" for uid in uids)
+    else:
+        args.extend(f"--pid={pid}" for pid in pids)
     args.append(f"*:{level}")
     return args
 
 
+def _spawn_logcat(
+    adb: str,
+    args: list[str],
+    serial: str,
+    path: Path,
+    handle: BinaryIO,
+    lines: list[int],
+    lock: threading.Lock,
+    keyword: str,
+    package: str,
+) -> LogCapture:
+    errors = bytearray()
+    process = _popen_output(adb, args)
+    err_reader = threading.Thread(target=_read_stream, args=(process.stderr, errors), daemon=True)
+    reader = threading.Thread(
+        target=_read_logcat,
+        args=(process.stdout, handle, lock, lines, keyword),
+        daemon=True,
+    )
+    err_reader.start()
+    reader.start()
+    return LogCapture(
+        serial=serial,
+        path=path,
+        process=process,
+        errors=errors,
+        reader=reader,
+        err_reader=err_reader,
+        handle=handle,
+        lock=lock,
+        lines=lines,
+        package=package,
+    )
+
+
+def _join_log_readers(capture: LogCapture) -> bool:
+    capture.reader.join(timeout=3)
+    capture.err_reader.join(timeout=1)
+    return not capture.reader.is_alive()
+
+
+def _should_retry_logcat(capture: LogCapture) -> bool:
+    detail = capture.errors.decode("utf-8", errors="replace")
+    cleaned = _clean_adb_error(detail.strip())
+    if cleaned in {_UNAUTHORIZED, _OFFLINE, _NO_DEVICE, "没有 USB 调试权限"}:
+        return False
+    if _LOG_ARG_ERROR.search(detail):
+        return True
+    with capture.lock:
+        count = capture.lines[0]
+    if count == 0:
+        return True
+    return not _written_log_looks_real(capture.handle)
+
+
+def _written_log_looks_real(handle: BinaryIO) -> bool:
+    handle.flush()
+    pos = handle.tell()
+    try:
+        handle.seek(len(_LOG_BOM))
+        sample = handle.read(4096)
+    finally:
+        handle.seek(pos)
+    return _LOG_LINE.search(sample) is not None
+
+
+def _rewind_log_handle(handle: BinaryIO, lines: list[int], lock: threading.Lock) -> None:
+    with lock:
+        handle.flush()
+        handle.seek(len(_LOG_BOM))
+        handle.truncate()
+        lines[0] = 0
+
+
+def _discard_log_file(handle: BinaryIO, path: Path) -> None:
+    try:
+        if not handle.closed:
+            handle.close()
+    except OSError:
+        pass
+    path.unlink(missing_ok=True)
+
+
 def _foreground_package(adb: str, serial: str) -> str:
-    stdout, stderr, code = _execute(adb, ["-s", serial, "shell", "dumpsys", "window"], 15, _APP_TIMEOUT)
+    stdout, stderr, code = _execute(adb, ["-s", serial, "shell", _FOCUS_QUERY], 15, _APP_TIMEOUT)
+    package = _parse_foreground_package(stdout)
+    if package:
+        return package
+    if "not found" in stderr and "grep" in stderr:
+        stdout, stderr, code = _execute(adb, ["-s", serial, "shell", "dumpsys", "window"], 15, _APP_TIMEOUT)
+        package = _parse_foreground_package(stdout)
+        if package:
+            return package
     if code != 0 and not stdout.strip():
         raise DensityError(_capture_failure(stderr, "无法识别当前应用"))
-    package = _parse_foreground_package(stdout)
-    if not package:
-        raise DensityError("无法识别当前应用")
-    return package
+    raise DensityError("无法识别当前应用")
 
 
 def _parse_foreground_package(text: str) -> str | None:
@@ -571,10 +710,50 @@ def _app_pids(adb: str, serial: str, package: str) -> list[str]:
     return []
 
 
+def _app_uids(adb: str, serial: str, pids: list[str]) -> list[str]:
+    """读取这些进程的 UID。同一 UID 的进程重启后仍能被 logcat --uid 跟上。"""
+    if any(not pid.isdigit() for pid in pids):
+        return []
+    script = "; ".join(f"grep '^Uid:' /proc/{pid}/status" for pid in pids)
+    try:
+        stdout, _stderr, _code = _execute(adb, ["-s", serial, "shell", script], 10, _APP_TIMEOUT)
+    except DensityError:
+        return []
+    uids: list[str] = []
+    seen: set[str] = set()
+    for line in stdout.splitlines():
+        match = _UID_LINE.match(line.strip())
+        if match is None:
+            continue
+        uid = match.group(1)
+        if uid in seen:
+            continue
+        seen.add(uid)
+        uids.append(uid)
+    return uids
+
+
 def _clear_logcat(adb: str, serial: str) -> None:
-    stdout, stderr, code = _execute(adb, ["-s", serial, "logcat", "-c"], 10, _LOG_CLEAR_TIMEOUT)
-    if code != 0:
-        raise DensityError(_capture_failure(stderr or stdout, "清空日志失败"))
+    """清空 main、system、crash 缓冲。旧系统不认识分缓冲清空时，退回一次整体清空。"""
+    cleared = _clear_logcat_buffers(adb, serial, _LOG_BUFFERS)
+    if cleared is None:
+        return
+    if _LOG_ARG_ERROR.search(cleared):
+        cleared = _clear_logcat_buffers(adb, serial, ())
+        if cleared is None:
+            return
+    raise DensityError(_capture_failure(cleared, "清空日志失败"))
+
+
+def _clear_logcat_buffers(adb: str, serial: str, buffers: tuple[str, ...]) -> str | None:
+    args = ["-s", serial, "logcat"]
+    for name in buffers:
+        args.extend(["-b", name])
+    args.append("-c")
+    stdout, stderr, code = _execute(adb, args, 10, _LOG_CLEAR_TIMEOUT)
+    if code == 0:
+        return None
+    return stderr or stdout
 
 
 def _close_log_handle(capture: LogCapture) -> None:
@@ -719,26 +898,55 @@ def _read_stream(stream, sink: bytearray) -> None:
 
 
 def _read_logcat(stream, handle: BinaryIO, lock: threading.Lock, lines: list[int], keyword: str) -> None:
+    """把 logcat 按整行过滤后写入文件，大约每 0.2 秒刷一次盘。"""
     if stream is None:
         return
     needles = tuple(part.casefold() for part in (item.strip() for item in keyword.split("|")) if part)
+    pending = bytearray()
+    pending_lines = 0
+    stop = threading.Event()
+
+    def flush_pending() -> bool:
+        nonlocal pending_lines
+        with lock:
+            if handle.closed:
+                pending.clear()
+                pending_lines = 0
+                return False
+            if not pending:
+                return True
+            handle.write(pending)
+            handle.flush()
+            lines[0] += pending_lines
+            pending.clear()
+            pending_lines = 0
+            return True
+
+    def timed_flush() -> None:
+        while not stop.wait(_LOG_FLUSH_SECONDS):
+            if not flush_pending():
+                return
+
+    flusher = threading.Thread(target=timed_flush, daemon=True)
+    flusher.start()
     try:
         for raw in stream:
-            text = raw.decode("utf-8", errors="replace")
-            folded = text.casefold()
-            if needles and not any(needle in folded for needle in needles):
-                continue
-            data = text.encode("utf-8")
+            if needles:
+                folded = raw.decode("utf-8", errors="replace").casefold()
+                if not any(needle in folded for needle in needles):
+                    continue
             with lock:
                 if handle.closed:
                     return
-                handle.write(data)
-                handle.flush()
-                lines[0] += 1
+                pending.extend(raw)
+                pending_lines += 1
+                oversized = len(pending) >= _LOG_FLUSH_BYTES
+            if oversized and not flush_pending():
+                return
     finally:
-        with lock:
-            if not handle.closed:
-                handle.flush()
+        stop.set()
+        flusher.join(timeout=1)
+        flush_pending()
 
 
 def _screenshot_via_pull(adb: str, serial: str, timeout: float, prior_error: str) -> Path:

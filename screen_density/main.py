@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter
 from pathlib import Path
 
@@ -231,8 +232,6 @@ class App(ctk.CTkFrame):
             log_row, text="仅当前应用", font=FONT_SM, width=118, state="disabled"
         )
         self.log_app_only.pack(side="left", padx=(12, 0))
-        self.log_clear = ctk.CTkCheckBox(log_row, text="开始前清空", font=FONT_SM, width=118, state="disabled")
-        self.log_clear.pack(side="left", padx=(8, 0))
         self.log_button = ctk.CTkButton(log_row, text="抓日志", width=88, command=self._on_log, state="disabled")
         self.log_button.pack(side="left", padx=(8, 0))
 
@@ -424,7 +423,6 @@ class App(ctk.CTkFrame):
             self.log_keyword.configure(state="disabled")
             self.log_level.configure(state="disabled")
             self.log_app_only.configure(state="disabled")
-            self.log_clear.configure(state="disabled")
         else:
             log_ready = ready and not self._recording
             self.log_button.configure(text="抓日志", state="normal" if log_ready else "disabled")
@@ -432,7 +430,6 @@ class App(ctk.CTkFrame):
             self.log_keyword.configure(state=filter_state)
             self.log_level.configure(state=filter_state)
             self.log_app_only.configure(state=filter_state)
-            self.log_clear.configure(state=filter_state)
         self._set_file_controls()
 
     def _enable_file_drop(self) -> None:
@@ -701,7 +698,6 @@ class App(ctk.CTkFrame):
         keyword = self.log_keyword.get().strip()
         level = _LOG_LEVEL_BY_LABEL[self.log_level.get()]
         app_only = bool(self.log_app_only.get())
-        clear = bool(self.log_clear.get())
         self._logging = True
         self._log_stopping = False
         stop_event = threading.Event()
@@ -709,10 +705,10 @@ class App(ctk.CTkFrame):
         serial = self._serial
         self.log_button.configure(text="停止", state="normal")
         self._update_capture_buttons()
-        self._set_status("正在开始抓取日志…", force=True)
+        self._set_status("正在清空手机日志…", force=True)
         threading.Thread(
             target=self._log_worker,
-            args=(serial, keyword, level, app_only, clear, stop_event),
+            args=(serial, keyword, level, app_only, stop_event),
             daemon=True,
         ).start()
 
@@ -722,23 +718,36 @@ class App(ctk.CTkFrame):
         keyword: str,
         level: str,
         app_only: bool,
-        clear: bool,
         stop_event: threading.Event,
     ) -> None:
         if stop_event.is_set():
             self._post_log_finish("", False)
             return
         try:
-            capture = start_logcat(serial, keyword=keyword, level=level, app_only=app_only, clear=clear)
+            capture = start_logcat(serial, keyword=keyword, level=level, app_only=app_only)
         except DensityError as err:
             self._post_log_finish(str(err), True)
             return
         self._post_log_started(stop_event, capture.package)
+        shown: int | None = None
+        last_post = time.monotonic()
         while capture.process.poll() is None and not stop_event.is_set():
             stop_event.wait(0.2)
+            now = time.monotonic()
+            if now - last_post < 1:
+                continue
+            last_post = now
+            with capture.lock:
+                count = capture.lines[0]
+            if count == shown:
+                continue
+            shown = count
+            self._post_log_progress(stop_event, capture.package, count)
         try:
             path = stop_logcat(capture)
-            message = f"已保存到 {path}"
+            with capture.lock:
+                count = capture.lines[0]
+            message = f"已保存到 {path}（{count} 行）"
             error = False
         except DensityError as err:
             message = str(err)
@@ -764,6 +773,31 @@ class App(ctk.CTkFrame):
             text = f"正在抓取 {package} 的日志，点停止后保存到 {SAVE_DIR}"
         else:
             text = f"正在抓取日志，点停止后保存到 {SAVE_DIR}"
+        self._set_status(text, force=True)
+
+    def _post_log_progress(self, stop_event: threading.Event, package: str, count: int) -> None:
+        try:
+            self.after(
+                0,
+                lambda stop_event=stop_event, package=package, count=count: self._show_log_progress(
+                    stop_event, package, count
+                ),
+            )
+        except (tkinter.TclError, RuntimeError):
+            stop_event.set()
+
+    def _show_log_progress(self, stop_event: threading.Event, package: str, count: int) -> None:
+        if stop_event.is_set() or not self._logging or self._log_stop is not stop_event or self._log_stopping:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except tkinter.TclError:
+            return
+        if package:
+            text = f"正在抓取 {package} 的日志，已写入 {count} 行"
+        else:
+            text = f"正在抓取日志，已写入 {count} 行"
         self._set_status(text, force=True)
 
     def _post_log_finish(self, message: str, error: bool) -> None:
