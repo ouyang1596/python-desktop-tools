@@ -41,6 +41,7 @@ class ApkInfo:
     version_code: str
     min_sdk: str
     target_sdk: str
+    compile_sdk: str
     abis: tuple[str, ...]
     permissions: tuple[Permission, ...]
     size: int
@@ -64,6 +65,7 @@ def read_apk(path: Path, *, timeout: float = 60) -> ApkInfo:
         version_code=info.version_code,
         min_sdk=info.min_sdk,
         target_sdk=info.target_sdk,
+        compile_sdk=info.compile_sdk,
         abis=info.abis,
         permissions=info.permissions,
         size=size,
@@ -96,6 +98,7 @@ def parse_badging(text: str) -> ApkInfo:
     version_code = ""
     min_sdk = ""
     target_sdk = ""
+    compile_sdk = ""
     abis: list[str] = []
     permissions: list[Permission] = []
     seen: set[tuple[str, bool]] = set()
@@ -108,6 +111,7 @@ def parse_badging(text: str) -> ApkInfo:
             package = fields.get("name", package)
             version_name = fields.get("versionName", version_name)
             version_code = fields.get("versionCode", version_code)
+            compile_sdk = fields.get("compileSdkVersion", compile_sdk)
             continue
         if line.startswith("targetSdkVersion:"):
             target_sdk = _first_quoted(line) or target_sdk
@@ -136,6 +140,7 @@ def parse_badging(text: str) -> ApkInfo:
         version_code=version_code,
         min_sdk=min_sdk,
         target_sdk=target_sdk,
+        compile_sdk=compile_sdk,
         abis=tuple(abis),
         permissions=tuple(permissions),
         size=0,

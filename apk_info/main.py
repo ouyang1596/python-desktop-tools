@@ -31,6 +31,7 @@ _FIELDS = (
     ("version_code", "versionCode"),
     ("min_sdk", "minSdk"),
     ("target_sdk", "targetSdk"),
+    ("compile_sdk", "compileSdk"),
     ("abi", "ABI"),
     ("size", "大小"),
 )
@@ -158,6 +159,7 @@ class App(ctk.CTkFrame):
         self._set_value("version_code", info.version_code)
         self._set_value("min_sdk", info.min_sdk)
         self._set_value("target_sdk", info.target_sdk)
+        self._set_value("compile_sdk", info.compile_sdk)
         self._set_value("abi", "、".join(info.abis) if info.abis else "无原生库")
         self._set_value("size", format_size(info.size))
         lines = []

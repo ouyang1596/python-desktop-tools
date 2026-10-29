@@ -111,7 +111,7 @@ python -m screen_density
 
 ## APK 信息
 
-查看 apk 的应用名、包名、版本、minSdk、targetSdk、ABI 和权限。
+查看 apk 的应用名、包名、版本、minSdk、targetSdk、compileSdk、ABI 和权限。
 
 ### 启动
 
