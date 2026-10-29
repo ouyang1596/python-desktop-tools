@@ -5,14 +5,18 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import socket
 import subprocess
-import sys
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import BinaryIO
+
+import adbutils
+from adbutils import AdbClient, AdbConnection
+from adbutils.errors import AdbError, AdbInstallError, AdbSyncError, AdbTimeout
 
 
 class DensityError(Exception):
@@ -61,7 +65,7 @@ class Recording:
 
     serial: str
     remote: str
-    process: subprocess.Popen[bytes]
+    process: _AdbProcess
     errors: bytearray
     reader: threading.Thread
 
@@ -72,7 +76,7 @@ class LogCapture:
 
     serial: str
     path: Path
-    process: subprocess.Popen[bytes]
+    process: _AdbProcess
     errors: bytearray
     reader: threading.Thread
     err_reader: threading.Thread
@@ -109,6 +113,9 @@ _DENSITY = re.compile(r"(Physical|Override) density:\s*(\d+)")
 _SIZE = re.compile(r"(Physical|Override) size:\s*(\d+)x(\d+)")
 _NO_DEVICE = "没有检测到手机，请打开 USB 调试并连接"
 _NO_ADB = "未找到 adb，请安装 Android SDK platform-tools 并加入 PATH"
+_LIST_FAIL = "SCREEN_DENSITY_LIST_FAIL"
+_INSTALL_REMOTE = "/data/local/tmp/python-desktop-tools-install.apk"
+_resolved_adb: str | None = None
 _UNAUTHORIZED = "手机未授权，请在手机上允许 USB 调试"
 _OFFLINE = "设备离线"
 _TIMEOUT = "查询超时，请确认手机已解锁并允许 USB 调试"
@@ -128,6 +135,14 @@ _LOG_TIMEOUT = "停止抓取日志超时"
 _LOG_CLEAR_TIMEOUT = "清空日志缓冲超时"
 _APP_TIMEOUT = "读取当前应用超时"
 _LIST_TIMEOUT = "读取目录超时"
+_DIRECT_ADB_MESSAGES = frozenset({
+    _UNAUTHORIZED,
+    _OFFLINE,
+    _NO_DEVICE,
+    "没有 USB 调试权限",
+    "无法启动 adb",
+    _NO_ADB,
+})
 _LOG_LEVELS = frozenset({"V", "D", "I", "W", "E", "F"})
 _LOG_BOM = b"\xef\xbb\xbf"
 _LOG_EMPTY = "没有匹配到日志"
@@ -245,13 +260,26 @@ def screen_from_outputs(
 
 
 def find_adb() -> str:
-    found = shutil.which("adb")
-    if found:
-        return found
-    for path in _adb_candidates():
-        if path.is_file():
-            return str(path)
-    raise DensityError(_NO_ADB)
+    """本机 adb。先按 PATH 和 SDK 查找，没有时用 adbutils 自带的 adb。"""
+    global _resolved_adb
+    if _resolved_adb:
+        return _resolved_adb
+    if not os.environ.get("ADBUTILS_ADB_PATH"):
+        found = shutil.which("adb")
+        if not found:
+            for path in _adb_candidates():
+                if path.is_file():
+                    found = str(path)
+                    break
+        if found:
+            os.environ["ADBUTILS_ADB_PATH"] = found
+    try:
+        resolved = adbutils.adb_path()
+    except AdbError:
+        raise DensityError(_NO_ADB) from None
+    os.environ["ADBUTILS_ADB_PATH"] = resolved
+    _resolved_adb = resolved
+    return resolved
 
 
 def start_scrcpy(serial: str) -> subprocess.Popen[bytes]:
@@ -273,8 +301,7 @@ def start_scrcpy(serial: str) -> subprocess.Popen[bytes]:
 def probe(serial: str | None = None, *, timeout: float = 10) -> ProbeResult:
     """查询已连接手机。serial 为空时使用第一台已授权设备。"""
     try:
-        adb = find_adb()
-        devices = tuple(parse_devices(_run(adb, ["devices", "-l"], timeout)))
+        devices = tuple(_list_devices(timeout))
     except DensityError as err:
         return ProbeResult((), None, str(err), True)
     if not devices:
@@ -285,7 +312,7 @@ def probe(serial: str | None = None, *, timeout: float = 10) -> ProbeResult:
     if chosen.state != "device":
         return ProbeResult(devices, None, _state_message(chosen.state), True)
     try:
-        screen = _read_screen(adb, chosen.serial, timeout)
+        screen = _read_screen(chosen.serial, timeout)
     except DensityError as err:
         return ProbeResult(devices, None, str(err), True)
     message = "已读取，当前为覆盖密度" if screen.overridden else "已读取"
@@ -297,17 +324,16 @@ def install_apk(serial: str, path: str, *, timeout: float = 300) -> None:
     apk = Path(path)
     if not apk.is_file() or apk.suffix.lower() != ".apk":
         raise DensityError("请拖入 apk 文件")
-    adb = find_adb()
-    stdout, stderr, code = _execute(
-        adb,
-        ["-s", serial, "install", "-r", str(apk)],
-        timeout,
-        _INSTALL_TIMEOUT,
-    )
-    text = _normalize(f"{stdout}\n{stderr}")
-    if code == 0 and re.search(r"\bSuccess\b", text):
-        return
-    raise DensityError(install_failure_message(text))
+    device = _device(serial, timeout)
+    try:
+        device.sync.push(apk, _INSTALL_REMOTE)
+        device.install_remote(_INSTALL_REMOTE, clean=True, flags=["-r"])
+    except AdbInstallError as err:
+        _remove_remote(serial, _INSTALL_REMOTE)
+        raise DensityError(install_failure_message(err.output)) from None
+    except (AdbError, AdbSyncError, OSError, socket.timeout, TimeoutError) as err:
+        _remove_remote(serial, _INSTALL_REMOTE)
+        raise _transfer_error(err, _INSTALL_TIMEOUT, install_failure_message) from None
 
 
 def install_failure_message(text: str) -> str:
@@ -330,16 +356,11 @@ def push_file(serial: str, path: str, *, timeout: float = 300) -> None:
     name = source.name
     if not source.is_file() or not name or name in {".", ".."}:
         raise DensityError("请拖入文件")
-    adb = find_adb()
-    stdout, stderr, code = _execute(
-        adb,
-        ["-s", serial, "push", str(source), f"{_REMOTE_DIR}/{name}"],
-        timeout,
-        _PUSH_TIMEOUT,
-    )
-    if code == 0:
-        return
-    raise DensityError(push_failure_message(f"{stdout}\n{stderr}"))
+    device = _device(serial, timeout)
+    try:
+        device.sync.push(source, f"{_REMOTE_DIR}/{name}")
+    except (AdbError, AdbSyncError, OSError, socket.timeout, TimeoutError) as err:
+        raise _transfer_error(err, _PUSH_TIMEOUT, push_failure_message) from None
 
 
 def push_failure_message(text: str) -> str:
@@ -352,16 +373,11 @@ def push_failure_message(text: str) -> str:
 def list_remote(serial: str, path: str, *, timeout: float = 15) -> tuple[RemoteEntry, ...]:
     """列出手机目录。目录（含指向目录的符号链接）以 / 结尾。"""
     remote = _clean_remote(path)
-    adb = find_adb()
-    stdout, stderr, code = _execute(
-        adb,
-        ["-s", serial, "shell", _list_shell(remote)],
-        timeout,
-        _LIST_TIMEOUT,
-    )
-    if code != 0:
-        raise DensityError(_list_failure(stderr.strip() or stdout.strip()))
-    return tuple(_parse_remote_listing(remote, stdout))
+    result = _shell(serial, _list_shell(remote), timeout, _LIST_TIMEOUT)
+    failed = _listing_error(result)
+    if failed:
+        raise DensityError(failed)
+    return tuple(_parse_remote_listing(remote, result.stdout))
 
 
 def pull_remote_file(serial: str, remote: str, *, timeout: float = 300) -> Path:
@@ -369,9 +385,8 @@ def pull_remote_file(serial: str, remote: str, *, timeout: float = 300) -> Path:
     name = _windows_filename(_remote_basename(remote))
     if not name or name in {".", ".."}:
         raise DensityError("无法保存该文件")
-    adb = find_adb()
     local = _reserve_named(name)
-    _pull_file(adb, serial, remote, local, timeout, allow_empty=True)
+    _pull_file(serial, remote, local, timeout, allow_empty=True)
     return local
 
 
@@ -382,33 +397,27 @@ def pull_remote_into(serial: str, remote: str, dest: Path, *, timeout: float = 1
     if not name or name in {".", ".."}:
         raise DensityError("无法读取该文件")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _pull_file(find_adb(), serial, cleaned, dest, timeout)
+    _pull_file(serial, cleaned, dest, timeout)
 
 
 def capture_screenshot(serial: str, *, timeout: float = 30) -> Path:
     """截取当前画面并保存为 PNG，返回本机路径。"""
-    adb = find_adb()
-    data, stderr, _code = _execute_binary(
-        adb,
-        ["-s", serial, "exec-out", "screencap", "-p"],
-        timeout,
-        _SCREENSHOT_TIMEOUT,
-    )
+    data = _shell_bytes(serial, ["screencap", "-p"], timeout, _SCREENSHOT_TIMEOUT)
     if data.startswith(_PNG_MAGIC):
         return _write_bytes(_reserve_path("截屏", ".png"), data)
-    return _screenshot_via_pull(adb, serial, timeout, stderr)
+    detail = data.decode("utf-8", errors="replace")
+    return _screenshot_via_pull(serial, timeout, detail)
 
 
 def start_recording(serial: str) -> Recording:
     """开始录屏。最长 3 分钟，到时手机上的 screenrecord 会自己退出。"""
-    adb = find_adb()
     remote = _remote_temp(".mp4")
-    process = _popen(
-        adb,
-        ["-s", serial, "shell", "screenrecord", "--time-limit", _RECORD_LIMIT_SECONDS, remote],
+    process = _open_stream(
+        serial,
+        ["screenrecord", "--time-limit", _RECORD_LIMIT_SECONDS, remote],
     )
     errors = bytearray()
-    reader = threading.Thread(target=_read_stream, args=(process.stderr, errors), daemon=True)
+    reader = threading.Thread(target=_read_process_output, args=(process, errors), daemon=True)
     reader.start()
     try:
         process.wait(timeout=0.5)
@@ -420,19 +429,18 @@ def start_recording(serial: str) -> Recording:
 
 def stop_recording(recording: Recording, *, timeout: float = 30) -> Path:
     """结束录屏，把视频拉到本机后删除手机上的临时文件。进程已退出时直接拉取。"""
-    adb = find_adb()
     try:
-        _stop_record_process(recording, adb, timeout)
+        _stop_record_process(recording, timeout)
         recording.reader.join(timeout=1)
         local = _reserve_path("录屏", ".mp4")
-        _pull_file(adb, recording.serial, recording.remote, local, timeout)
+        _pull_file(recording.serial, recording.remote, local, timeout)
         if _is_mp4(local):
             return local
         local.unlink(missing_ok=True)
         detail = recording.errors.decode("utf-8", errors="replace")
         raise DensityError(_capture_failure(detail, "录屏失败"))
     finally:
-        _remove_remote(adb, recording.serial, recording.remote)
+        _remove_remote(recording.serial, recording.remote)
 
 
 def start_logcat(
@@ -446,16 +454,15 @@ def start_logcat(
     chosen = level.strip().upper()
     if chosen not in _LOG_LEVELS:
         raise DensityError("无法识别的日志等级")
-    adb = find_adb()
     package = ""
     pids: list[str] = []
     uids: list[str] = []
     if app_only:
-        package = _foreground_package(adb, serial)
-        pids = _app_pids(adb, serial, package)
+        package = _foreground_package(serial)
+        pids = _app_pids(serial, package)
         if not pids:
             raise DensityError(f"当前应用没有在运行：{package}")
-        uids = _app_uids(adb, serial, pids)
+        uids = _app_uids(serial, pids)
     path = _reserve_path("日志", ".txt")
     try:
         handle = path.open("w+b", buffering=_LOG_FLUSH_BYTES)
@@ -464,16 +471,16 @@ def start_logcat(
         raise DensityError("无法保存文件") from None
     lines = [0]
     lock = threading.Lock()
-    attempts = _logcat_attempts(serial, chosen, uids, pids)
+    attempts = _logcat_attempts(chosen, uids, pids)
     last_errors = bytearray()
     try:
         handle.write(_LOG_BOM)
         handle.flush()
-        _clear_logcat(adb, serial)
+        _clear_logcat(serial)
         for index, args in enumerate(attempts):
             if index:
                 _rewind_log_handle(handle, lines, lock)
-            capture = _spawn_logcat(adb, args, serial, path, handle, lines, lock, keyword, package)
+            capture = _spawn_logcat(args, serial, path, handle, lines, lock, keyword, package)
             try:
                 capture.process.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
@@ -535,28 +542,23 @@ def stop_logcat(capture: LogCapture, *, timeout: float = 5) -> Path:
 
 
 def _logcat_attempts(
-    serial: str,
     level: str,
     uids: list[str],
     pids: list[str],
 ) -> list[list[str]]:
     preferred = _logcat_command(
-        serial,
         level,
         uids=uids,
         pids=pids,
         log_format=_LOG_FORMAT,
         buffers=_LOG_BUFFERS,
-        raw=True,
     )
     fallback = _logcat_command(
-        serial,
         level,
         uids=[],
         pids=pids,
         log_format=_LOG_FORMAT_PLAIN,
         buffers=(),
-        raw=False,
     )
     if fallback == preferred:
         return [preferred]
@@ -564,19 +566,14 @@ def _logcat_attempts(
 
 
 def _logcat_command(
-    serial: str,
     level: str,
     *,
     uids: list[str],
     pids: list[str],
     log_format: str,
     buffers: tuple[str, ...],
-    raw: bool,
 ) -> list[str]:
-    if raw:
-        args = ["-s", serial, "exec-out", "logcat", "-v", log_format]
-    else:
-        args = ["-s", serial, "logcat", "-v", log_format]
+    args = ["logcat", "-v", log_format]
     for name in buffers:
         args.extend(["-b", name])
     if uids:
@@ -588,7 +585,6 @@ def _logcat_command(
 
 
 def _spawn_logcat(
-    adb: str,
     args: list[str],
     serial: str,
     path: Path,
@@ -599,11 +595,11 @@ def _spawn_logcat(
     package: str,
 ) -> LogCapture:
     errors = bytearray()
-    process = _popen_output(adb, args)
+    process = _open_stream(serial, args)
     err_reader = threading.Thread(target=_read_stream, args=(process.stderr, errors), daemon=True)
     reader = threading.Thread(
         target=_read_logcat,
-        args=(process.stdout, handle, lock, lines, keyword),
+        args=(process.stdout, handle, lock, lines, keyword, process, errors),
         daemon=True,
     )
     err_reader.start()
@@ -670,18 +666,20 @@ def _discard_log_file(handle: BinaryIO, path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-def _foreground_package(adb: str, serial: str) -> str:
-    stdout, stderr, code = _execute(adb, ["-s", serial, "shell", _FOCUS_QUERY], 15, _APP_TIMEOUT)
-    package = _parse_foreground_package(stdout)
+def _foreground_package(serial: str) -> str:
+    result = _shell(serial, _FOCUS_QUERY, 15, _APP_TIMEOUT)
+    package = _parse_foreground_package(result.stdout)
     if package:
         return package
-    if "not found" in stderr and "grep" in stderr:
-        stdout, stderr, code = _execute(adb, ["-s", serial, "shell", "dumpsys", "window"], 15, _APP_TIMEOUT)
-        package = _parse_foreground_package(stdout)
+    combined = f"{result.stderr}\n{result.stdout}"
+    if "not found" in combined and "grep" in combined:
+        result = _shell(serial, "dumpsys window", 15, _APP_TIMEOUT)
+        package = _parse_foreground_package(result.stdout)
         if package:
             return package
-    if code != 0 and not stdout.strip():
-        raise DensityError(_capture_failure(stderr, "无法识别当前应用"))
+    if result.code != 0 and not result.stdout.strip():
+        detail = result.stderr or result.stdout
+        raise DensityError(_capture_failure(detail, "无法识别当前应用"))
     raise DensityError("无法识别当前应用")
 
 
@@ -700,28 +698,28 @@ def _labeled_package(text: str, label: str) -> str | None:
     return None
 
 
-def _app_pids(adb: str, serial: str, package: str) -> list[str]:
-    stdout, stderr, code = _execute(adb, ["-s", serial, "shell", "pidof", package], 10, _APP_TIMEOUT)
-    pids = re.findall(r"\d+", stdout)
+def _app_pids(serial: str, package: str) -> list[str]:
+    result = _shell(serial, ["pidof", package], 10, _APP_TIMEOUT)
+    pids = re.findall(r"\d+", result.stdout)
     if pids:
         return pids
-    if code != 0 and stderr.strip():
-        raise DensityError(_capture_failure(stderr, "无法识别当前应用"))
+    if result.code != 0 and result.stderr.strip():
+        raise DensityError(_capture_failure(result.stderr, "无法识别当前应用"))
     return []
 
 
-def _app_uids(adb: str, serial: str, pids: list[str]) -> list[str]:
+def _app_uids(serial: str, pids: list[str]) -> list[str]:
     """读取这些进程的 UID。同一 UID 的进程重启后仍能被 logcat --uid 跟上。"""
     if any(not pid.isdigit() for pid in pids):
         return []
     script = "; ".join(f"grep '^Uid:' /proc/{pid}/status" for pid in pids)
     try:
-        stdout, _stderr, _code = _execute(adb, ["-s", serial, "shell", script], 10, _APP_TIMEOUT)
+        result = _shell(serial, script, 10, _APP_TIMEOUT)
     except DensityError:
         return []
     uids: list[str] = []
     seen: set[str] = set()
-    for line in stdout.splitlines():
+    for line in result.stdout.splitlines():
         match = _UID_LINE.match(line.strip())
         if match is None:
             continue
@@ -733,27 +731,27 @@ def _app_uids(adb: str, serial: str, pids: list[str]) -> list[str]:
     return uids
 
 
-def _clear_logcat(adb: str, serial: str) -> None:
+def _clear_logcat(serial: str) -> None:
     """清空 main、system、crash 缓冲。旧系统不认识分缓冲清空时，退回一次整体清空。"""
-    cleared = _clear_logcat_buffers(adb, serial, _LOG_BUFFERS)
+    cleared = _clear_logcat_buffers(serial, _LOG_BUFFERS)
     if cleared is None:
         return
     if _LOG_ARG_ERROR.search(cleared):
-        cleared = _clear_logcat_buffers(adb, serial, ())
+        cleared = _clear_logcat_buffers(serial, ())
         if cleared is None:
             return
     raise DensityError(_capture_failure(cleared, "清空日志失败"))
 
 
-def _clear_logcat_buffers(adb: str, serial: str, buffers: tuple[str, ...]) -> str | None:
-    args = ["-s", serial, "logcat"]
+def _clear_logcat_buffers(serial: str, buffers: tuple[str, ...]) -> str | None:
+    args = ["logcat"]
     for name in buffers:
         args.extend(["-b", name])
     args.append("-c")
-    stdout, stderr, code = _execute(adb, args, 10, _LOG_CLEAR_TIMEOUT)
-    if code == 0:
+    result = _shell(serial, args, 10, _LOG_CLEAR_TIMEOUT)
+    if result.code == 0:
         return None
-    return stderr or stdout
+    return result.stderr or result.stdout
 
 
 def _close_log_handle(capture: LogCapture) -> None:
@@ -764,17 +762,12 @@ def _close_log_handle(capture: LogCapture) -> None:
         capture.handle.close()
 
 
-def _stop_record_process(recording: Recording, adb: str, timeout: float) -> None:
+def _stop_record_process(recording: Recording, timeout: float) -> None:
     process = recording.process
     if process.poll() is not None:
         return
     try:
-        _execute(
-            adb,
-            ["-s", recording.serial, "shell", "kill -2 $(pidof screenrecord)"],
-            10,
-            _RECORD_TIMEOUT,
-        )
+        _shell(recording.serial, "kill -2 $(pidof screenrecord)", 10, _RECORD_TIMEOUT)
     except DensityError:
         pass
     try:
@@ -795,7 +788,7 @@ def device_label(device: Device) -> str:
     return f"{name}（{_state_name(device.state)}）"
 
 
-def _read_screen(adb: str, serial: str, timeout: float) -> ScreenDensity:
+def _read_screen(serial: str, timeout: float) -> ScreenDensity:
     command = (
         f"wm density; echo {_SPLIT}; "
         f"wm size; echo {_SPLIT}; "
@@ -804,102 +797,219 @@ def _read_screen(adb: str, serial: str, timeout: float) -> ScreenDensity:
         f"getprop ro.build.version.release; echo {_SPLIT}; "
         "getprop ro.build.version.sdk"
     )
-    parts = _run(adb, ["-s", serial, "shell", command], timeout).split(_SPLIT)
+    result = _shell(serial, command, timeout, _TIMEOUT)
+    if result.code != 0 and not result.stdout.strip():
+        raise DensityError(_clean_adb_error(result.stderr.strip()))
+    parts = result.stdout.split(_SPLIT)
     if len(parts) < 6:
         raise DensityError("无法读取屏幕密度")
     return screen_from_outputs(serial, parts[0], parts[1], parts[2], parts[3], parts[4], parts[5])
 
 
-def _run(adb: str, args: list[str], timeout: float) -> str:
-    stdout, stderr, code = _execute(adb, args, timeout, _TIMEOUT)
-    if code != 0 and not stdout.strip():
-        raise DensityError(_clean_adb_error(stderr.strip()))
-    return stdout
+class _AdbProcess:
+    """长时间 shell 流。poll、wait、terminate 给录屏和日志判断是否还在跑。"""
+
+    def __init__(self, connection: AdbConnection) -> None:
+        self._connection = connection
+        self._done = threading.Event()
+        self._closed = False
+        self.returncode: int | None = None
+        try:
+            connection.conn.settimeout(None)
+        except OSError:
+            pass
+        self.stdout = connection.conn.makefile("rb")
+        self.stderr = None
+
+    def poll(self) -> int | None:
+        if self._done.is_set():
+            return 0 if self.returncode is None else self.returncode
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        if not self._done.wait(timeout):
+            raise subprocess.TimeoutExpired("adb", 0 if timeout is None else timeout)
+        return 0 if self.returncode is None else self.returncode
+
+    def terminate(self) -> None:
+        self.kill()
+
+    def kill(self) -> None:
+        self._close()
+        self.finish()
+
+    def finish(self) -> None:
+        self._close()
+        if self.returncode is None:
+            self.returncode = 0
+        self._done.set()
+
+    def _close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.stdout.close()
+        except OSError:
+            pass
+        try:
+            self._connection.close()
+        except OSError:
+            pass
 
 
-def _execute(adb: str, args: list[str], timeout: float, timeout_message: str) -> tuple[str, str, int]:
-    kwargs: dict = {}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+@dataclass
+class _ShellResult:
+    stdout: str
+    stderr: str
+    code: int
+
+
+def _device(serial: str, timeout: float | None = None) -> adbutils.AdbDevice:
+    find_adb()
+    return AdbClient(socket_timeout=timeout).device(serial)
+
+
+def _list_devices(timeout: float) -> list[Device]:
+    find_adb()
     try:
-        completed = subprocess.run(
-            [adb, *args],
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-            **kwargs,
-        )
-    except subprocess.TimeoutExpired:
-        raise DensityError(timeout_message) from None
-    except OSError:
-        raise DensityError("无法启动 adb") from None
-    stdout = _normalize(completed.stdout.decode("utf-8", errors="replace"))
-    stderr = _normalize(completed.stderr.decode("utf-8", errors="replace"))
-    return stdout, stderr, completed.returncode
+        infos = AdbClient(socket_timeout=timeout).list(extended=True)
+    except (AdbError, OSError, socket.timeout, TimeoutError) as err:
+        raise _from_adb_error(err, _TIMEOUT) from None
+    devices: list[Device] = []
+    for info in infos:
+        tags = info.tags or {}
+        model = tags.get("model", "") if isinstance(tags, dict) else ""
+        state = info.state
+        if state == "no":
+            state = "no permissions"
+        devices.append(Device(info.serial, state, model))
+    return devices
 
 
-def _execute_binary(adb: str, args: list[str], timeout: float, timeout_message: str) -> tuple[bytes, str, int]:
-    """执行 adb 并保留原始标准输出，供截屏这类二进制结果使用。"""
-    kwargs: dict = {}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+def _shell(
+    serial: str,
+    command: str | list[str],
+    timeout: float,
+    timeout_message: str,
+) -> _ShellResult:
     try:
-        completed = subprocess.run(
-            [adb, *args],
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-            **kwargs,
-        )
-    except subprocess.TimeoutExpired:
-        raise DensityError(timeout_message) from None
-    except OSError:
-        raise DensityError("无法启动 adb") from None
-    stderr = _normalize(completed.stderr.decode("utf-8", errors="replace"))
-    return completed.stdout, stderr, completed.returncode
+        result = _device(serial).shell2(command, timeout=timeout, v2=True)
+    except (AdbError, OSError, socket.timeout, TimeoutError, ValueError) as err:
+        raise _from_adb_error(err, timeout_message) from None
+    if result.stdout or result.stderr:
+        stdout, stderr = result.stdout, result.stderr
+    else:
+        stdout, stderr = result.output, ""
+    return _ShellResult(_normalize(stdout), _normalize(stderr), result.returncode)
 
 
-def _popen(adb: str, args: list[str]) -> subprocess.Popen[bytes]:
-    kwargs: dict = {}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+def _shell_bytes(
+    serial: str,
+    command: str | list[str],
+    timeout: float,
+    timeout_message: str,
+) -> bytes:
     try:
-        return subprocess.Popen(
-            [adb, *args],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            **kwargs,
-        )
-    except OSError:
-        raise DensityError("无法启动 adb") from None
+        data = _device(serial).shell(command, timeout=timeout, encoding=None)
+    except (AdbError, OSError, socket.timeout, TimeoutError) as err:
+        raise _from_adb_error(err, timeout_message) from None
+    if isinstance(data, bytes):
+        return data
+    return str(data).encode("utf-8", errors="replace")
 
 
-def _popen_output(adb: str, args: list[str]) -> subprocess.Popen[bytes]:
-    """启动 adb 并保留标准输出，供 logcat 这类持续输出使用。"""
-    kwargs: dict = {}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+def _open_stream(serial: str, command: list[str]) -> _AdbProcess:
     try:
-        return subprocess.Popen(
-            [adb, *args],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            **kwargs,
-        )
-    except OSError:
-        raise DensityError("无法启动 adb") from None
+        connection = _device(serial).shell(command, stream=True)
+    except (AdbError, OSError, socket.timeout, TimeoutError) as err:
+        raise _from_adb_error(err, "无法启动 adb") from None
+    if not isinstance(connection, AdbConnection):
+        raise DensityError("无法启动 adb")
+    return _AdbProcess(connection)
+
+
+def _listing_error(result: _ShellResult) -> str | None:
+    for line in result.stdout.splitlines():
+        if not line.startswith(_LIST_FAIL):
+            continue
+        detail = line[len(_LIST_FAIL) :].strip() or result.stderr.strip()
+        return _list_failure(detail)
+    if result.code != 0:
+        return _list_failure(result.stderr.strip() or result.stdout.strip())
+    return None
+
+
+def _error_text(err: BaseException) -> str:
+    if isinstance(err, AdbInstallError):
+        return err.output
+    parts: list[str] = []
+    for part in err.args:
+        if isinstance(part, bytes):
+            text = part.decode("utf-8", errors="replace")
+        else:
+            text = str(part)
+        if text.strip():
+            parts.append(text)
+    return "\n".join(parts) if parts else str(err)
+
+
+def _from_adb_error(err: BaseException, timeout_message: str) -> DensityError:
+    if isinstance(err, (AdbTimeout, socket.timeout, TimeoutError)):
+        return DensityError(timeout_message)
+    text = _error_text(err)
+    lower = text.lower()
+    if "no adb exe" in lower or "could be found" in lower:
+        return DensityError(_NO_ADB)
+    if "connect to adb server" in lower:
+        return DensityError("无法启动 adb")
+    return DensityError(_clean_adb_error(text))
+
+
+def _transfer_error(
+    err: BaseException,
+    timeout_message: str,
+    wrap,
+) -> DensityError:
+    failure = _from_adb_error(err, timeout_message)
+    message = str(failure)
+    if message == timeout_message or message in _DIRECT_ADB_MESSAGES:
+        return failure
+    return DensityError(wrap(message))
 
 
 def _read_stream(stream, sink: bytearray) -> None:
     if stream is None:
         return
-    sink.extend(stream.read())
+    try:
+        sink.extend(stream.read())
+    except (OSError, ValueError):
+        return
 
 
-def _read_logcat(stream, handle: BinaryIO, lock: threading.Lock, lines: list[int], keyword: str) -> None:
+def _read_process_output(process: _AdbProcess, sink: bytearray) -> None:
+    try:
+        data = process.stdout.read()
+        if data:
+            sink.extend(data)
+    except (OSError, ValueError):
+        return
+    finally:
+        process.finish()
+
+
+def _read_logcat(
+    stream,
+    handle: BinaryIO,
+    lock: threading.Lock,
+    lines: list[int],
+    keyword: str,
+    process: _AdbProcess,
+    errors: bytearray,
+) -> None:
     """把 logcat 按整行过滤后写入文件，大约每 0.2 秒刷一次盘。"""
     if stream is None:
+        process.finish()
         return
     needles = tuple(part.casefold() for part in (item.strip() for item in keyword.split("|")) if part)
     pending = bytearray()
@@ -931,8 +1041,11 @@ def _read_logcat(stream, handle: BinaryIO, lock: threading.Lock, lines: list[int
     flusher.start()
     try:
         for raw in stream:
+            text = raw.decode("utf-8", errors="replace")
+            if _LOG_ARG_ERROR.search(text):
+                errors.extend(raw)
             if needles:
-                folded = raw.decode("utf-8", errors="replace").casefold()
+                folded = text.casefold()
                 if not any(needle in folded for needle in needles):
                     continue
             with lock:
@@ -943,45 +1056,45 @@ def _read_logcat(stream, handle: BinaryIO, lock: threading.Lock, lines: list[int
                 oversized = len(pending) >= _LOG_FLUSH_BYTES
             if oversized and not flush_pending():
                 return
+    except (OSError, ValueError):
+        return
     finally:
         stop.set()
         flusher.join(timeout=1)
         flush_pending()
+        process.finish()
 
 
-def _screenshot_via_pull(adb: str, serial: str, timeout: float, prior_error: str) -> Path:
+def _screenshot_via_pull(serial: str, timeout: float, prior_error: str) -> Path:
     remote = _remote_temp(".png")
     try:
-        stdout, stderr, code = _execute(
-            adb,
-            ["-s", serial, "shell", "screencap", "-p", remote],
-            timeout,
-            _SCREENSHOT_TIMEOUT,
-        )
-        if code != 0:
-            detail = stderr or stdout or prior_error
+        result = _shell(serial, ["screencap", "-p", remote], timeout, _SCREENSHOT_TIMEOUT)
+        if result.code != 0:
+            detail = result.stderr or result.stdout or prior_error
             raise DensityError(_capture_failure(detail, "截屏失败"))
         local = _reserve_path("截屏", ".png")
-        _pull_file(adb, serial, remote, local, timeout)
+        _pull_file(serial, remote, local, timeout)
         if not _is_png_file(local):
             local.unlink(missing_ok=True)
             raise DensityError(_capture_failure(prior_error, "截屏失败"))
         return local
     finally:
-        _remove_remote(adb, serial, remote)
+        _remove_remote(serial, remote)
 
 
-def _pull_file(adb: str, serial: str, remote: str, local: Path, timeout: float, *, allow_empty: bool = False) -> None:
-    stdout, stderr, code = _execute(
-        adb,
-        ["-s", serial, "pull", remote, str(local)],
-        timeout,
-        _SAVE_TIMEOUT,
-    )
-    if code == 0 and local.is_file() and (allow_empty or local.stat().st_size > 0):
+def _pull_file(serial: str, remote: str, local: Path, timeout: float, *, allow_empty: bool = False) -> None:
+    device = _device(serial, timeout)
+    try:
+        device.sync.pull(remote, local)
+    except (AdbError, AdbSyncError, OSError, socket.timeout, TimeoutError) as err:
+        if local.is_file():
+            local.unlink(missing_ok=True)
+        raise _transfer_error(err, _SAVE_TIMEOUT, _pull_failure_message) from None
+    if local.is_file() and (allow_empty or local.stat().st_size > 0):
         return
-    local.unlink(missing_ok=True)
-    raise DensityError(_pull_failure_message(f"{stdout}\n{stderr}"))
+    if local.is_file():
+        local.unlink(missing_ok=True)
+    raise DensityError("保存失败")
 
 
 def _pull_failure_message(text: str) -> str:
@@ -991,9 +1104,9 @@ def _pull_failure_message(text: str) -> str:
     return f"保存失败：{lines[-1]}"
 
 
-def _remove_remote(adb: str, serial: str, remote: str) -> None:
+def _remove_remote(serial: str, remote: str) -> None:
     try:
-        _execute(adb, ["-s", serial, "shell", "rm", "-f", remote], 10, "保存失败")
+        _shell(serial, ["rm", "-f", remote], 10, "保存失败")
     except DensityError:
         return
 
@@ -1025,15 +1138,17 @@ def _list_shell(remote: str) -> str:
     从 /sdcard 点上级回到 / 之后就点不回去。test -d 会跟着链接走。
     """
     quoted = _shell_quote(remote)
+    token = _LIST_FAIL
     return (
-        f"cd {quoted} || exit 1; "
-        "list=$(ls -1A) || exit 1; "
+        f"if cd {quoted} 2>/dev/null; then "
+        f"if list=$(ls -1A 2>&1); then "
         "printf '%s\\n' \"$list\" | while IFS= read -r name; do "
         "[ -n \"$name\" ] || continue; "
         "if [ -d \"$name\" ]; then printf '%s/\\n' \"$name\"; "
         "else printf '%s\\n' \"$name\"; fi; "
         "done; "
-        "exit 0"
+        f"else printf '%s %s\\n' {token} \"$list\"; fi; "
+        f"else err=$(cd {quoted} 2>&1); printf '%s %s\\n' {token} \"$err\"; fi"
     )
 
 
@@ -1203,7 +1318,12 @@ def _clean_adb_error(stderr: str) -> str:
         return _UNAUTHORIZED
     if "offline" in lower:
         return _OFFLINE
-    if "no devices" in lower or "no emulators" in lower:
+    if (
+        "no devices" in lower
+        or "no emulators" in lower
+        or "can't find any android device" in lower
+        or "cannot find any android device" in lower
+    ):
         return _NO_DEVICE
     if not stderr:
         return "adb 执行失败"
