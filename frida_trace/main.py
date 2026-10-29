@@ -14,7 +14,16 @@ import customtkinter as ctk
 
 from screen_density.density import Device, device_label
 
-from frida_trace.tracer import AppInfo, TraceError, Tracer, format_hit, list_apps, list_devices, save_trace_log
+from frida_trace.tracer import (
+    AppInfo,
+    TraceError,
+    Tracer,
+    format_hit,
+    list_apps,
+    list_devices,
+    prepare_trace,
+    save_trace_log,
+)
 
 FONT = ("Microsoft YaHei UI", 13)
 FONT_SM = ("Microsoft YaHei UI", 12)
@@ -215,6 +224,8 @@ class App(ctk.CTkFrame):
         self._app_infos: list[AppInfo] = []
         self._apps_by_label: dict[str, str] = {}
         self._tracer = Tracer()
+        self._pattern_mode = False
+        self._cap_logged = False
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
         self._build()
@@ -300,8 +311,15 @@ class App(ctk.CTkFrame):
         self.class_entry = ctk.CTkEntry(form, font=FONT_CODE, placeholder_text="com.example.Foo")
         self.class_entry.grid(row=2, column=1, sticky="ew", pady=(0, 8))
         ctk.CTkLabel(form, text="方法名", font=FONT, anchor="w", width=72).grid(row=3, column=0, sticky="w")
-        self.method_entry = ctk.CTkEntry(form, font=FONT_CODE, placeholder_text="onCreate、initView 或 <init>")
+        self.method_entry = ctk.CTkEntry(form, font=FONT_CODE, placeholder_text="onCreate、*encrypt* 或 <init>")
         self.method_entry.grid(row=3, column=1, sticky="ew")
+        ctk.CTkLabel(
+            form,
+            text="含 * 时按模式跟踪，不打印堆栈。构造方法写 <init>",
+            font=FONT_SM,
+            anchor="w",
+            text_color=EMPTY_COLOR,
+        ).grid(row=4, column=1, sticky="w", pady=(4, 0))
 
         buttons = ctk.CTkFrame(target, fg_color="transparent")
         buttons.grid(row=2, column=0, sticky="w", padx=16, pady=(4, 16))
@@ -485,21 +503,25 @@ class App(ctk.CTkFrame):
             hint = f"，类名对应包名可能是 {guess}" if guess else ""
             self._set_status(f"「{package}」不是包名，请选列表里的项或填写包名{hint}", error=True)
             return
-        if not class_name or not method_name:
-            self._set_status("请填写类名和方法名", error=True)
+        try:
+            config = prepare_trace(class_name, method_name)
+        except TraceError as err:
+            self._set_status(str(err), error=True)
             return
+        shown_method = str(config.get("displayName") or method_name)
+        self._pattern_mode = config.get("mode") == "pattern"
+        self._cap_logged = False
         self.app_menu.set(package)
         self._trace_token += 1
         token = self._trace_token
         self._tracing = True
         self._set_stop_enabled(True)
         self._set_status(f"正在挂钩 {package}")
-        self._append_log(f"开始挂钩 {package} / {class_name}.{method_name}\n")
+        self._append_log(f"开始挂钩 {package} / {class_name}.{shown_method}\n")
         self._tracer.start(
             phone.serial,
             package,
-            class_name,
-            method_name,
+            config,
             lambda payload, token=token: self._on_event(token, payload),
         )
 
@@ -563,12 +585,29 @@ class App(ctk.CTkFrame):
                 count_text = str(int(count))
             except (TypeError, ValueError):
                 count_text = "1"
+            if payload.get("pattern"):
+                capped = bool(payload.get("capped"))
+                if capped:
+                    message = f"已挂钩 {count_text} 个方法，已达上限，请缩小模式"
+                else:
+                    message = f"已挂钩 {count_text} 个方法，等待调用"
+                self._set_status(message)
+                if capped:
+                    if not self._cap_logged:
+                        self._cap_logged = True
+                        self._append_log(message + "\n\n")
+                elif payload.get("first"):
+                    self._append_log(message + "…\n\n")
+                return
             self._set_status(f"已挂钩 {count_text} 个重载，等待方法被调用")
             self._append_log(f"已挂钩 {count_text} 个重载，等待调用…\n\n")
             return
         if kind == "hit":
             self._append_log(format_hit(payload))
-            self._set_status("已打印调用堆栈")
+            if self._pattern_mode:
+                self._set_status("已记录调用")
+            else:
+                self._set_status("已打印调用堆栈")
             return
         if kind == "error":
             self._trace_token += 1

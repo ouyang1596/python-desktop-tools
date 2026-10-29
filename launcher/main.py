@@ -69,7 +69,7 @@ TOOLS = (
     {
         "key": "frida",
         "title": "Frida",
-        "description": "打印指定 Java 方法的调用堆栈",
+        "description": "打印调用堆栈和返回值，类名或方法名含 * 时按模式跟踪",
     },
 )
 

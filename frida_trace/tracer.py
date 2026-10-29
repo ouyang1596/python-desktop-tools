@@ -1,4 +1,4 @@
-"""连接手机上的 frida-server，挂钩 Java 方法并取调用堆栈。"""
+"""连接手机上的 frida-server，挂钩 Java 方法并记录参数、返回值和调用堆栈。"""
 
 from __future__ import annotations
 
@@ -42,6 +42,9 @@ _FRIDA_MISSING = "本机未安装 frida，请先执行 pip install -r requiremen
 _FRIDA_DOWN = "连不上 frida-server。请确认手机上已启动，且版本与本机 frida 一致"
 _FRIDA_NO_DEVICE = "Frida 未发现这台手机。请确认 frida-server 已在该设备上运行"
 _ARG_LIMIT = 400
+_PATTERN_LIMIT = 40
+_TOO_WIDE = "模式太宽，请把类名或方法名写具体一点"
+_NEED_TARGET = "请填写类名和方法名"
 
 _BOOTSTRAP = r"""
 function loadFridaBridge(name) {
@@ -174,50 +177,235 @@ function similarClasses() {
   return matches;
 }
 
+function describeReturn(overload, value) {
+  var ret = overload.returnType;
+  var name = ret ? typeName(ret) : "";
+  if (name === "void" || name === "V") return "void";
+  return describe(value);
+}
+
+function captureCall(overload, argList, withStack) {
+  var parts = [];
+  var types = [];
+  var stack = "";
+  depth += 1;
+  try {
+    for (var i = 0; i < argList.length; i++) parts.push(describe(argList[i]));
+    var argTypes = overload.argumentTypes || [];
+    for (var j = 0; j < argTypes.length; j++) types.push(typeName(argTypes[j]));
+    if (withStack) {
+      try {
+        var Log = Java.use("android.util.Log");
+        var Exception = Java.use("java.lang.Exception");
+        stack = String(Log.getStackTraceString(Exception.$new()));
+      } catch (e) {
+        stack = String(e);
+      }
+    }
+  } catch (e) {
+  } finally {
+    depth -= 1;
+  }
+  return {args: parts.join(", "), types: types.join(", "), stack: stack};
+}
+
+function installOverload(overload, className, displayName, withStack) {
+  overload.implementation = function () {
+    if (depth > 0) return overload.apply(this, arguments);
+    var argList = [];
+    for (var i = 0; i < arguments.length; i++) argList.push(arguments[i]);
+    var meta = captureCall(overload, argList, withStack);
+    var thrown = null;
+    var result;
+    try {
+      result = overload.apply(this, argList);
+    } catch (err) {
+      thrown = err;
+    }
+    depth += 1;
+    try {
+      var payload = {
+        type: "hit",
+        signature: className + "." + displayName + "(" + meta.types + ")",
+        args: meta.args
+      };
+      if (withStack) payload.stack = meta.stack;
+      if (thrown) payload.thrown = describe(thrown);
+      else payload.retval = describeReturn(overload, result);
+      send(payload);
+    } catch (e) {
+    } finally {
+      depth -= 1;
+    }
+    if (thrown) throw thrown;
+    return result;
+  };
+}
+
+function hookOverloads(clazz, className, fridaName, displayName, withStack) {
+  var method = clazz[fridaName];
+  if (!method || !method.overloads || method.overloads.length === 0) return 0;
+  var overloads = method.overloads;
+  for (var n = 0; n < overloads.length; n++) {
+    installOverload(overloads[n], className, displayName, withStack);
+  }
+  return overloads.length;
+}
+
 function hookClass(clazz) {
-  var method = clazz[config.methodName];
-  if (!method || !method.overloads || method.overloads.length === 0) {
+  var count = hookOverloads(clazz, config.className, config.methodName, config.displayName, true);
+  if (!count) {
     send({type: "error", message: "方法不存在：" + config.className + "." + config.displayName});
     return "missing";
   }
-  var overloads = method.overloads;
-  for (var n = 0; n < overloads.length; n++) {
+  send({type: "ready", count: count});
+  return "ok";
+}
+
+var seen = {};
+var visited = {};
+var hookedCount = 0;
+var capSent = false;
+var announcedReady = false;
+var loaderHooked = false;
+var classRe = null;
+var methodRe = null;
+
+function sendReady(capped) {
+  var first = !announcedReady;
+  announcedReady = true;
+  send({
+    type: "ready",
+    count: hookedCount,
+    pattern: true,
+    capped: !!capped,
+    first: first
+  });
+}
+
+function notifyCap() {
+  if (capSent) return;
+  capSent = true;
+  sendReady(true);
+}
+
+function hookNamed(clazz, className, fridaName) {
+  var key = className + "\n" + fridaName;
+  if (seen[key]) return false;
+  if (className === "java.lang.ClassLoader" && fridaName === "loadClass") return false;
+  if (hookedCount >= config.limit) {
+    notifyCap();
+    return false;
+  }
+  var display = fridaName === "$init" ? "<init>" : fridaName;
+  var method = clazz[fridaName];
+  if (!method || !method.overloads || method.overloads.length === 0) return false;
+  var installed = 0;
+  try {
+    for (var n = 0; n < method.overloads.length; n++) {
+      installOverload(method.overloads[n], className, display, false);
+      installed += 1;
+    }
+  } catch (e) {
+    if (!installed) return false;
+  }
+  seen[key] = true;
+  hookedCount += 1;
+  return true;
+}
+
+function considerClass(className, announce) {
+  if (capSent || !className || visited[className]) return;
+  if (className.indexOf("/") >= 0 && className.indexOf(".") < 0) {
+    className = className.replace(/\//g, ".");
+  }
+  if (!className || visited[className]) return;
+  if (className.charAt(0) === "[") {
+    visited[className] = true;
+    return;
+  }
+  if (!classRe.test(className)) {
+    visited[className] = true;
+    return;
+  }
+  var clazz;
+  try {
+    clazz = Java.use(className);
+  } catch (e) {
+    if (announce) visited[className] = true;
+    return;
+  }
+  visited[className] = true;
+  var wanted = {};
+  try {
+    var declared = clazz.class.getDeclaredMethods();
+    for (var i = 0; i < declared.length; i++) {
+      var reflected = declared[i];
+      if ((reflected.getModifiers() & 1024) !== 0) continue;
+      var name = String(reflected.getName());
+      if (!methodRe.test(name)) continue;
+      wanted[name === "<init>" ? "$init" : name] = true;
+    }
+  } catch (e) {
+  }
+  if (config.includeInit) wanted["$init"] = true;
+  var added = false;
+  for (var fridaName in wanted) {
+    if (hookNamed(clazz, className, fridaName)) added = true;
+    if (capSent) break;
+  }
+  if (announce && added && !capSent) sendReady(false);
+}
+
+function scanLoaded() {
+  var names = Java.enumerateLoadedClassesSync();
+  for (var i = 0; i < names.length; i++) {
+    if (capSent) break;
+    try {
+      considerClass(String(names[i]), false);
+    } catch (e) {
+    }
+  }
+  if (hookedCount > 0 && !announcedReady) sendReady(false);
+}
+
+function later(fn) {
+  if (typeof setImmediate === "function") setImmediate(fn);
+  else setTimeout(fn, 0);
+}
+
+function hookClassLoader() {
+  if (loaderHooked || capSent) return;
+  loaderHooked = true;
+  var ClassLoader = Java.use("java.lang.ClassLoader");
+  var overloads = ClassLoader.loadClass.overloads;
+  for (var i = 0; i < overloads.length; i++) {
     (function (overload) {
       overload.implementation = function () {
-        if (depth > 0) return overload.apply(this, arguments);
-        depth += 1;
-        try {
-          try {
-            var stack = "";
+        var result = overload.apply(this, arguments);
+        if (capSent || !arguments.length) return result;
+        var name = String(arguments[0]);
+        later(function () {
+          if (capSent || !name) return;
+          Java.perform(function () {
             try {
-              var Log = Java.use("android.util.Log");
-              var Exception = Java.use("java.lang.Exception");
-              stack = String(Log.getStackTraceString(Exception.$new()));
+              considerClass(name, true);
             } catch (e) {
-              stack = String(e);
             }
-            var parts = [];
-            for (var i = 0; i < arguments.length; i++) parts.push(describe(arguments[i]));
-            var types = [];
-            var argTypes = overload.argumentTypes || [];
-            for (var j = 0; j < argTypes.length; j++) types.push(typeName(argTypes[j]));
-            send({
-              type: "hit",
-              signature: config.className + "." + config.displayName + "(" + types.join(", ") + ")",
-              args: parts.join(", "),
-              stack: stack
-            });
-          } catch (e) {
-          }
-          return overload.apply(this, arguments);
-        } finally {
-          depth -= 1;
-        }
+          });
+        });
+        return result;
       };
-    })(overloads[n]);
+    })(overloads[i]);
   }
-  send({type: "ready", count: overloads.length});
-  return "ok";
+}
+
+function startPattern() {
+  classRe = new RegExp(config.classRe);
+  methodRe = new RegExp(config.methodRe);
+  scanLoaded();
+  hookClassLoader();
+  if (hookedCount === 0) send({type: "waiting"});
 }
 
 function scan() {
@@ -280,8 +468,30 @@ function tryHook() {
   }
 }
 
-tryHook();
-if (!hooked && !failed) timer = setInterval(tryHook, 500);
+function boot() {
+  if (config.mode === "pattern") {
+    Java.perform(function () {
+      if (!Java.available) {
+        send({type: "error", message: "当前进程没有 Java 运行时"});
+        return;
+      }
+      try {
+        startPattern();
+      } catch (e) {
+        send({type: "error", message: "挂钩失败：" + String(e)});
+      }
+    });
+    return;
+  }
+  tryHook();
+  if (!hooked && !failed) timer = setInterval(tryHook, 500);
+}
+
+try {
+  boot();
+} catch (e) {
+  send({type: "error", message: "挂钩失败：" + String(e)});
+}
 """
 
 
@@ -330,17 +540,75 @@ def list_apps(serial: str) -> list[AppInfo]:
     return _running_from(apps, procs)
 
 
+def _clip(text: str) -> str:
+    if len(text) > _ARG_LIMIT:
+        return text[:_ARG_LIMIT] + "…"
+    return text
+
+
+def _has_literal(pattern: str) -> bool:
+    return any(ch not in "*. " for ch in pattern)
+
+
+def _glob_regex(pattern: str) -> str:
+    return "^" + "".join(".*" if ch == "*" else re.escape(ch) for ch in pattern) + "$"
+
+
+def _glob_matches(pattern: str, text: str) -> bool:
+    return re.search(_glob_regex(pattern), text) is not None
+
+
+def prepare_trace(class_name: str, method_name: str) -> dict:
+    """精确挂钩；类名或方法名含 * 时改为模式跟踪。"""
+    class_name = class_name.strip()
+    method_name = method_name.strip()
+    if not class_name:
+        raise TraceError(_NEED_TARGET)
+    if "*" not in class_name and "*" not in method_name:
+        if not method_name:
+            raise TraceError(_NEED_TARGET)
+        display = method_name
+        return {
+            "mode": "exact",
+            "className": class_name,
+            "methodName": "$init" if display == "<init>" else display,
+            "displayName": display,
+            "classRe": "",
+            "methodRe": "",
+            "includeInit": False,
+            "limit": _PATTERN_LIMIT,
+        }
+    if not method_name:
+        method_name = "*"
+    if not _has_literal(class_name) and not _has_literal(method_name):
+        raise TraceError(_TOO_WIDE)
+    return {
+        "mode": "pattern",
+        "className": class_name,
+        "methodName": method_name,
+        "displayName": method_name,
+        "classRe": _glob_regex(class_name),
+        "methodRe": _glob_regex(method_name),
+        "includeInit": _glob_matches(method_name, "<init>") or _glob_matches(method_name, "$init"),
+        "limit": _PATTERN_LIMIT,
+    }
+
+
 def format_hit(payload: dict, *, now: datetime | None = None) -> str:
     """把一次调用整理成可追加到日志的文本。"""
     moment = now or datetime.now()
     signature = str(payload.get("signature") or "").strip()
-    args = " ".join(str(payload.get("args") or "").split())
-    if len(args) > _ARG_LIMIT:
-        args = args[:_ARG_LIMIT] + "…"
-    stack = str(payload.get("stack") or "").strip()
+    args = _clip(" ".join(str(payload.get("args") or "").split()))
     lines = [f"{moment:%H:%M:%S}  {signature}"]
     if args:
         lines.append(f"参数: {args}")
+    if "thrown" in payload:
+        thrown = _clip(" ".join(str(payload.get("thrown") or "").split()))
+        lines.append(f"抛出: {thrown}")
+    elif "retval" in payload:
+        retval = _clip(" ".join(str(payload.get("retval") if payload.get("retval") is not None else "").split()))
+        lines.append(f"返回: {retval}")
+    stack = str(payload.get("stack") or "").strip()
     if stack:
         lines.append(stack)
     return "\n".join(lines) + "\n\n"
@@ -575,7 +843,7 @@ def _stamp_blocks(
 
 
 class Tracer:
-    """一次只挂钩一个方法。再次开始或 stop 会卸掉上一次。"""
+    """挂钩一个方法，或按模式挂钩一批方法。再次开始或 stop 会卸掉上一次。"""
 
     def __init__(self) -> None:
         self._stop = threading.Event()
@@ -585,8 +853,7 @@ class Tracer:
         self,
         serial: str,
         package: str,
-        class_name: str,
-        method_name: str,
+        config: dict,
         on_event: Callable[[dict], None],
     ) -> None:
         self.stop()
@@ -596,7 +863,7 @@ class Tracer:
         self._stop = stop
         threading.Thread(
             target=self._run,
-            args=(serial, package, class_name, method_name, on_event, holder, stop),
+            args=(serial, package, config, on_event, holder, stop),
             daemon=True,
         ).start()
 
@@ -608,8 +875,7 @@ class Tracer:
         self,
         serial: str,
         package: str,
-        class_name: str,
-        method_name: str,
+        config: dict,
         on_event: Callable[[dict], None],
         holder: dict[str, object],
         stop: threading.Event,
@@ -622,7 +888,7 @@ class Tracer:
             if stop.is_set():
                 return
             bridge = _java_bridge_source()
-            script = session.create_script(_build_script(class_name, method_name))
+            script = session.create_script(_build_script(config))
 
             def on_message(message, _data) -> None:
                 if _serve_java_bridge(message, script, bridge):
@@ -661,14 +927,9 @@ class Tracer:
             _unload(holder)
 
 
-def _build_script(class_name: str, method_name: str) -> str:
-    display = method_name.strip()
-    hook_name = "$init" if display == "<init>" else display
-    config = json.dumps(
-        {"className": class_name.strip(), "methodName": hook_name, "displayName": display},
-        ensure_ascii=False,
-    )
-    return _BOOTSTRAP + _SCRIPT.replace("__CONFIG__", config, 1)
+def _build_script(config: dict) -> str:
+    payload = json.dumps(config, ensure_ascii=False)
+    return _BOOTSTRAP + _SCRIPT.replace("__CONFIG__", payload, 1)
 
 
 def _running_from(apps: list[tuple[str, str, int]], processes: list[tuple[str, int]]) -> list[AppInfo]:
